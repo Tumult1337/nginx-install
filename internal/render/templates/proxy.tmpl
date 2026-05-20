@@ -1,0 +1,64 @@
+{{- if .SSL }}
+server {
+    listen 80;
+    listen [::]:80;
+    server_name {{ .Host }};
+    return 301 https://$host$request_uri;
+}
+{{ end }}
+upstream {{ .UpstreamName }} {
+    server {{ .Upstream }} max_fails=2 fail_timeout=5s;
+    keepalive          256;
+    keepalive_requests 10000;
+    keepalive_time     1h;
+    keepalive_timeout  60s;
+}
+
+server {
+{{- if .SSL }}
+{{- if .HTTP2Inline }}
+    listen 443 ssl http2;
+    listen [::]:443 ssl http2;
+{{- else }}
+    listen 443 ssl;
+    listen [::]:443 ssl;
+    http2 on;
+{{- end }}
+
+    ssl_certificate     {{ .CertDir }}/fullchain.pem;
+    ssl_certificate_key {{ .CertDir }}/privkey.pem;
+    add_header Strict-Transport-Security "max-age=63072000; includeSubDomains" always;
+{{- if .IsCF }}
+
+    # Cloudflare Origin CA has no OCSP responder; disable stapling to avoid
+    # the "issuer certificate not found" warning. Only CF connects here, and
+    # CF doesn't OCSP-check origin certs.
+    ssl_stapling off;
+    ssl_stapling_verify off;
+{{- end }}
+{{- else }}
+    listen 80;
+    listen [::]:80;
+{{- end }}
+
+    server_name {{ .Host }};
+{{- if .IsCF }}
+
+    include /etc/nginx/snippets/cf-allow.conf;
+{{- else if .IsList }}
+
+{{- range .AllowCIDRs }}
+    allow {{ . }};
+{{- end }}
+    deny all;
+{{- end }}
+
+{{- if not .IsCF }}
+    limit_conn perip 100;
+    limit_req  zone=reqip burst=100 nodelay;
+{{- end }}
+
+    location / {
+        proxy_pass http://{{ .UpstreamName }};
+    }
+}
