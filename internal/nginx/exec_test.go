@@ -30,6 +30,14 @@ func (f *fakeExec) Run(name string, args ...string) ([]byte, error) {
 	return f.out, f.err
 }
 
+func (f *fakeExec) RunEnv(name string, _ []string, args ...string) ([]byte, error) {
+	return f.Run(name, args...)
+}
+
+func (f *fakeExec) RunDir(_, name string, args ...string) ([]byte, error) {
+	return f.Run(name, args...)
+}
+
 func TestTestSuccess(t *testing.T) {
 	f := &fakeExec{wantName: "nginx", wantArgs: []string{"-t"}, out: []byte("ok\n")}
 	if err := Test(f); err != nil {

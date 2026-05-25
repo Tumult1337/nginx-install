@@ -5,6 +5,7 @@ package nginx
 
 import (
 	"fmt"
+	"os"
 	"os/exec"
 	"regexp"
 	"strconv"
@@ -14,12 +15,29 @@ import (
 // Tests inject a fake; production uses RealExecer.
 type Execer interface {
 	Run(name string, args ...string) ([]byte, error)
+	// RunEnv runs the command with extra environment variables appended to
+	// the parent's environment (later entries win, same as exec.Cmd.Env).
+	RunEnv(name string, env []string, args ...string) ([]byte, error)
+	// RunDir runs the command with its working directory set to dir.
+	RunDir(dir, name string, args ...string) ([]byte, error)
 }
 
 type RealExecer struct{}
 
 func (RealExecer) Run(name string, args ...string) ([]byte, error) {
 	return exec.Command(name, args...).CombinedOutput()
+}
+
+func (RealExecer) RunEnv(name string, env []string, args ...string) ([]byte, error) {
+	cmd := exec.Command(name, args...)
+	cmd.Env = append(os.Environ(), env...)
+	return cmd.CombinedOutput()
+}
+
+func (RealExecer) RunDir(dir, name string, args ...string) ([]byte, error) {
+	cmd := exec.Command(name, args...)
+	cmd.Dir = dir
+	return cmd.CombinedOutput()
 }
 
 // Test runs `nginx -t`. Returns nil on success; on failure the error wraps

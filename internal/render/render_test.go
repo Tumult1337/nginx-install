@@ -183,7 +183,15 @@ func TestMain(t *testing.T) {
 	mustNotContain(t, s, "reqip_cf")
 	mustNotContain(t, s, "$cf_rl_key")
 	mustContain(t, s, "ssl_protocols             TLSv1.2 TLSv1.3;")
+	mustContain(t, s, "include /etc/nginx/conf.d/*.conf;")
 	mustContain(t, s, "include /etc/nginx/sites-enabled/*.conf;")
+	// conf.d include must precede sites-enabled so http-scope snippets
+	// (e.g. `map` blocks) are visible to all vhosts.
+	confdIdx := strings.Index(s, "/etc/nginx/conf.d/*.conf")
+	sitesIdx := strings.Index(s, "/etc/nginx/sites-enabled/*.conf")
+	if confdIdx < 0 || sitesIdx < 0 || confdIdx > sitesIdx {
+		t.Errorf("conf.d include must precede sites-enabled; conf.d=%d sites=%d", confdIdx, sitesIdx)
+	}
 	mustNotContain(t, s, "brotli") // Brotli=false → no brotli directives
 }
 

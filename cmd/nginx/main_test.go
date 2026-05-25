@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"nginx-gen/internal/marker"
+	"nginx-gen/internal/nginx"
 )
 
 var fixedNow = time.Date(2026, 5, 3, 12, 0, 0, 0, time.UTC)
@@ -21,14 +22,18 @@ func tempLayout(t *testing.T) Layout {
 	t.Helper()
 	dir := t.TempDir()
 	return Layout{
-		SitesAvailable: filepath.Join(dir, "sites-available"),
-		SitesEnabled:   filepath.Join(dir, "sites-enabled"),
-		MainConfPath:   filepath.Join(dir, "nginx.conf"),
-		BackupDir:      filepath.Join(dir, "backups"),
-		LockPath:       filepath.Join(dir, "lock"),
-		SnippetPath:    filepath.Join(dir, "snippets/cf-allow.conf"),
-		CachePath:      filepath.Join(dir, "lib/cf-allow.conf"),
-		CertDir:        filepath.Join(dir, "letsencrypt"),
+		SitesAvailable:    filepath.Join(dir, "sites-available"),
+		SitesEnabled:      filepath.Join(dir, "sites-enabled"),
+		MainConfPath:      filepath.Join(dir, "nginx.conf"),
+		BackupDir:         filepath.Join(dir, "backups"),
+		LockPath:          filepath.Join(dir, "lock"),
+		SnippetPath:       filepath.Join(dir, "snippets/cf-allow.conf"),
+		CachePath:         filepath.Join(dir, "lib/cf-allow.conf"),
+		CertDir:            filepath.Join(dir, "letsencrypt"),
+		SysctlPath:         filepath.Join(dir, "sysctl.d/99-nginx.conf"),
+		SystemdOverrideDir: filepath.Join(dir, "systemd/nginx.service.d"),
+		ModulesDir:         filepath.Join(dir, "modules"),
+		ModulesEnabledDir:  filepath.Join(dir, "modules-enabled"),
 	}
 }
 
@@ -48,6 +53,14 @@ func (f *fakeExec) Run(name string, args ...string) ([]byte, error) {
 		return f.out[name], e
 	}
 	return f.out[name], nil
+}
+
+func (f *fakeExec) RunEnv(name string, _ []string, args ...string) ([]byte, error) {
+	return f.Run(name, args...)
+}
+
+func (f *fakeExec) RunDir(_, name string, args ...string) ([]byte, error) {
+	return f.Run(name, args...)
 }
 
 func (f *fakeExec) called(name string) bool {
@@ -384,6 +397,482 @@ func TestRunListAfterDeploys(t *testing.T) {
 		if !strings.Contains(out, h) {
 			t.Errorf("list missing %s:\n%s", h, out)
 		}
+	}
+}
+
+// ---- --brotli ----
+
+func TestParseBrotliMode(t *testing.T) {
+	tests := []struct {
+		in   string
+		want BrotliMode
+		err  bool
+	}{
+		{"", BrotliAuto, false},
+		{"auto", BrotliAuto, false},
+		{"AUTO", BrotliAuto, false},
+		{"on", BrotliOn, false},
+		{"true", BrotliOn, false},
+		{"yes", BrotliOn, false},
+		{"1", BrotliOn, false},
+		{"off", BrotliOff, false},
+		{"false", BrotliOff, false},
+		{"no", BrotliOff, false},
+		{"0", BrotliOff, false},
+		{"maybe", 0, true},
+	}
+	for _, tc := range tests {
+		got, err := parseBrotliMode(tc.in)
+		if tc.err {
+			if err == nil {
+				t.Errorf("%q: want error, got nil", tc.in)
+			}
+			continue
+		}
+		if err != nil {
+			t.Errorf("%q: unexpected error: %v", tc.in, err)
+			continue
+		}
+		if got != tc.want {
+			t.Errorf("%q: want %v, got %v", tc.in, tc.want, got)
+		}
+	}
+}
+
+func TestRunMainBrotliOffSkipsApt(t *testing.T) {
+	d, exec, _, stderr := defaultDepsFor(t)
+
+	code := Run([]string{"--main", "--brotli=off"}, d)
+	if code != exitOK {
+		t.Fatalf("exit=%d stderr=%s", code, stderr)
+	}
+	for _, c := range exec.calls {
+		if c[0] == "apt-get" || c[0] == "apt-cache" || c[0] == "dpkg-query" {
+			t.Errorf("--brotli=off must not invoke %s, got calls=%v", c[0], exec.calls)
+		}
+	}
+	b, _ := os.ReadFile(d.Layout.MainConfPath)
+	if bytes.Contains(b, []byte("brotli")) {
+		t.Errorf("--brotli=off must not emit brotli directives:\n%s", b)
+	}
+}
+
+func TestRunMainBrotliOnAbortsWhenInstallFails(t *testing.T) {
+	d, exec, _, stderr := defaultDepsFor(t)
+	exec.fail["apt-get"] = errors.New("exit 100")
+	exec.out["apt-get"] = []byte("E: Unable to locate package\n")
+
+	code := Run([]string{"--main", "--brotli=on"}, d)
+	if code != exitUserError {
+		t.Fatalf("expected exitUserError, got %d stderr=%s", code, stderr)
+	}
+	if _, err := os.Stat(d.Layout.MainConfPath); err == nil {
+		t.Errorf("--brotli=on failure must not write nginx.conf")
+	}
+	if !strings.Contains(stderr.String(), "--brotli=on") {
+		t.Errorf("expected error message mentioning --brotli=on:\n%s", stderr.String())
+	}
+}
+
+// Upstream nginx.org's package has no `Provides:` field — dpkg-query
+// returns empty. The probe must treat that as conclusive (no ABI match)
+// rather than inconclusive, to avoid a guaranteed-failure apt-get install.
+func TestEnsureBrotliSkipsAptOnEmptyProvides(t *testing.T) {
+	d, exec, _, stderr := defaultDepsFor(t)
+	exec.out["apt-cache"] = []byte("libnginx-mod-http-brotli-filter\n  Depends: nginx-abi-1.26.3-1\n")
+	exec.out["dpkg-query"] = []byte("") // succeeded, but no Provides
+
+	if got := ensureBrotli(d); got {
+		t.Errorf("empty Provides must short-circuit apt; got true")
+	}
+	if exec.called("apt-get") {
+		t.Errorf("apt-get must not run when probe shows missing ABI, got %v", exec.calls)
+	}
+	if !strings.Contains(stderr.String(), "nginx-abi-1.26.3-1") {
+		t.Errorf("warning should name the missing ABI:\n%s", stderr.String())
+	}
+}
+
+func TestEnsureBrotliSkipsAptOnABIMismatch(t *testing.T) {
+	d, exec, _, stderr := defaultDepsFor(t)
+	exec.out["apt-cache"] = []byte(`libnginx-mod-http-brotli-filter
+  Depends: nginx-abi-1.26.3-1
+  Depends: libbrotli1
+`)
+	exec.out["dpkg-query"] = []byte("nginx-abi-1.31.1-1, httpd")
+
+	if got := ensureBrotli(d); got {
+		t.Errorf("ensureBrotli should return false on ABI mismatch")
+	}
+	if exec.called("apt-get") {
+		t.Errorf("ABI mismatch must short-circuit before apt-get, got calls=%v", exec.calls)
+	}
+	if !strings.Contains(stderr.String(), "nginx-abi-1.26.3-1") {
+		t.Errorf("warning should name the missing ABI:\n%s", stderr.String())
+	}
+}
+
+func TestEnsureBrotliFallsThroughWhenProbeInconclusive(t *testing.T) {
+	d, exec, _, _ := defaultDepsFor(t)
+	// apt-cache fails (e.g. not installed) → probe inconclusive → still attempt install
+	exec.fail["apt-cache"] = errors.New("command not found")
+
+	_ = ensureBrotli(d)
+	if !exec.called("apt-get") {
+		t.Errorf("inconclusive probe should still try apt-get, got calls=%v", exec.calls)
+	}
+}
+
+// ---- --upgrade / --version-check ----
+
+func TestRunUpgradeDryRunPrintsRecipe(t *testing.T) {
+	d, exec, stdout, stderr := defaultDepsFor(t)
+	if code := Run([]string{"--upgrade", "--dry-run"}, d); code != exitOK {
+		t.Fatalf("exit=%d stderr=%s", code, stderr)
+	}
+	for _, want := range []string{
+		"apt-get install --only-upgrade -y nginx",
+		"--brotli-build --force",
+		"systemctl restart nginx",
+	} {
+		if !strings.Contains(stdout.String(), want) {
+			t.Errorf("dry-run missing %q:\n%s", want, stdout.String())
+		}
+	}
+	if exec.called("apt-get") {
+		t.Errorf("dry-run must not exec, got %v", exec.calls)
+	}
+}
+
+func TestBrotliBuildVersionParses(t *testing.T) {
+	dir := t.TempDir()
+	conf := filepath.Join(dir, brotliLoadConf)
+	if err := os.WriteFile(conf,
+		[]byte("# Managed by nginx-gen; built against nginx 1.31.1\nload_module x;\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if got := brotliBuildVersion(dir); got != "1.31.1" {
+		t.Errorf("want 1.31.1, got %q", got)
+	}
+}
+
+func TestBrotliBuildVersionEmptyOnMissing(t *testing.T) {
+	if got := brotliBuildVersion(t.TempDir()); got != "" {
+		t.Errorf("missing conf must return empty, got %q", got)
+	}
+}
+
+func TestBrotliBuildVersionEmptyOnHandWritten(t *testing.T) {
+	dir := t.TempDir()
+	conf := filepath.Join(dir, brotliLoadConf)
+	if err := os.WriteFile(conf,
+		[]byte("load_module modules/brotli.so;\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if got := brotliBuildVersion(dir); got != "" {
+		t.Errorf("hand-written conf must return empty, got %q", got)
+	}
+}
+
+func TestRunVersionCheckNoBrotli(t *testing.T) {
+	d, exec, stdout, _ := defaultDepsFor(t)
+	exec.out["nginx"] = []byte("nginx version: nginx/1.31.1\n")
+	if code := Run([]string{"--version-check"}, d); code != exitOK {
+		t.Fatalf("exit=%d stdout=%s", code, stdout)
+	}
+	if !strings.Contains(stdout.String(), "nginx: 1.31.1") {
+		t.Errorf("missing nginx line:\n%s", stdout.String())
+	}
+	if !strings.Contains(stdout.String(), "brotli: not installed") {
+		t.Errorf("missing 'not installed' line:\n%s", stdout.String())
+	}
+}
+
+func TestRunVersionCheckInSync(t *testing.T) {
+	d, exec, stdout, _ := defaultDepsFor(t)
+	exec.out["nginx"] = []byte("nginx version: nginx/1.31.1\n")
+	if err := os.MkdirAll(d.Layout.ModulesEnabledDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	conf := filepath.Join(d.Layout.ModulesEnabledDir, brotliLoadConf)
+	if err := os.WriteFile(conf,
+		[]byte("# Managed by nginx-gen; built against nginx 1.31.1\nload_module x;\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	if code := Run([]string{"--version-check"}, d); code != exitOK {
+		t.Fatalf("expected exitOK, got %d stdout=%s", code, stdout)
+	}
+	if !strings.Contains(stdout.String(), "(in sync)") {
+		t.Errorf("expected 'in sync':\n%s", stdout.String())
+	}
+}
+
+func TestRunVersionCheckDrift(t *testing.T) {
+	d, exec, stdout, _ := defaultDepsFor(t)
+	exec.out["nginx"] = []byte("nginx version: nginx/1.31.2\n")
+	if err := os.MkdirAll(d.Layout.ModulesEnabledDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	conf := filepath.Join(d.Layout.ModulesEnabledDir, brotliLoadConf)
+	if err := os.WriteFile(conf,
+		[]byte("# Managed by nginx-gen; built against nginx 1.31.1\nload_module x;\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	code := Run([]string{"--version-check"}, d)
+	if code != exitUserError {
+		t.Fatalf("expected exit 1 on drift, got %d stdout=%s", code, stdout)
+	}
+	if !strings.Contains(stdout.String(), "DRIFT") {
+		t.Errorf("expected DRIFT in output:\n%s", stdout.String())
+	}
+}
+
+// ---- --bootstrap ----
+
+func TestRunBootstrapDryRunShowsBothSteps(t *testing.T) {
+	d, exec, stdout, stderr := defaultDepsFor(t)
+
+	code := Run([]string{"--bootstrap", "--dry-run"}, d)
+	if code != exitOK {
+		t.Fatalf("exit=%d stderr=%s", code, stderr)
+	}
+	if exec.called("apt-get") || exec.called("systemctl") {
+		t.Errorf("dry-run must not exec, got %v", exec.calls)
+	}
+	// Step 1 markers (install recipe)
+	for _, want := range []string{
+		"nginx.org channel=mainline",
+		"apt-get install -y nginx",
+	} {
+		if !strings.Contains(stdout.String(), want) {
+			t.Errorf("missing install recipe %q in stdout:\n%s", want, stdout.String())
+		}
+	}
+	// Step 2 markers (sysctl recipe goes to stdout via runSysctl --dry-run)
+	for _, want := range []string{
+		"99-nginx.conf",
+		"tcp_congestion_control = bbr",
+	} {
+		if !strings.Contains(stdout.String(), want) {
+			t.Errorf("missing sysctl recipe %q in stdout:\n%s", want, stdout.String())
+		}
+	}
+	// Step delimiters go to stderr
+	for _, want := range []string{"step 1/2", "step 2/2"} {
+		if !strings.Contains(stderr.String(), want) {
+			t.Errorf("missing step marker %q in stderr:\n%s", want, stderr.String())
+		}
+	}
+}
+
+func TestRunBootstrapRejectsBadBrotli(t *testing.T) {
+	d, _, _, _ := defaultDepsFor(t)
+	if code := Run([]string{"--bootstrap", "--brotli=enabled"}, d); code != exitUserError {
+		t.Errorf("want exitUserError, got %d", code)
+	}
+}
+
+// Regression guard: --main --brotli=on with the module already loaded must
+// emit brotli directives. The previous runInstall bug was that the second
+// runMain (which emits the directives) was skipped when brotli-build was
+// skipped — leaving the module loaded but inert. The actual emission lives
+// in resolveBrotli + render.Main; cover it at that layer since runInstall
+// requires root.
+func TestRunMainWithBrotliOnAndModuleAlreadyLoadedEmitsDirectives(t *testing.T) {
+	d, _, _, stderr := defaultDepsFor(t)
+	if err := os.MkdirAll(d.Layout.ModulesEnabledDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	conf := filepath.Join(d.Layout.ModulesEnabledDir, "50-mod-http-brotli.conf")
+	if err := os.WriteFile(conf, []byte("load_module x;\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	if code := Run([]string{"--main", "--brotli=on"}, d); code != exitOK {
+		t.Fatalf("exit=%d stderr=%s", code, stderr)
+	}
+	b, err := os.ReadFile(d.Layout.MainConfPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Contains(b, []byte("brotli            on;")) {
+		t.Errorf("expected brotli directives when module loaded + --brotli=on, got:\n%s", b)
+	}
+}
+
+// ---- --install ----
+
+func TestParseChannel(t *testing.T) {
+	for _, tc := range []struct {
+		in   string
+		want nginxChannel
+		err  bool
+	}{
+		{"", channelMainline, false},
+		{"mainline", channelMainline, false},
+		{"MAINLINE", channelMainline, false},
+		{"stable", channelStable, false},
+		{"edge", "", true},
+	} {
+		got, err := parseChannel(tc.in)
+		if tc.err {
+			if err == nil {
+				t.Errorf("%q: want error", tc.in)
+			}
+			continue
+		}
+		if err != nil {
+			t.Errorf("%q: unexpected err: %v", tc.in, err)
+			continue
+		}
+		if got != tc.want {
+			t.Errorf("%q: want %q got %q", tc.in, tc.want, got)
+		}
+	}
+}
+
+func TestChannelAptURL(t *testing.T) {
+	if got := channelMainline.aptURL(); !strings.Contains(got, "/mainline/debian") {
+		t.Errorf("mainline URL missing /mainline/debian: %s", got)
+	}
+	if got := channelStable.aptURL(); strings.Contains(got, "mainline") {
+		t.Errorf("stable URL must not contain 'mainline': %s", got)
+	}
+}
+
+func TestRunInstallDryRunPrintsRecipe(t *testing.T) {
+	d, exec, stdout, stderr := defaultDepsFor(t)
+
+	code := Run([]string{"--install", "--dry-run"}, d)
+	if code != exitOK {
+		t.Fatalf("exit=%d stderr=%s", code, stderr)
+	}
+	out := stdout.String()
+	for _, want := range []string{
+		"nginx.org channel=mainline",
+		"nginx_signing.key",
+		"apt-get install -y nginx",
+		"render /etc/nginx/nginx.conf",
+		"systemctl",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("dry-run missing %q:\n%s", want, out)
+		}
+	}
+	if exec.called("apt-get") || exec.called("curl") || exec.called("systemctl") {
+		t.Errorf("dry-run must not exec anything, got %v", exec.calls)
+	}
+}
+
+func TestRunInstallStableChannel(t *testing.T) {
+	d, _, stdout, _ := defaultDepsFor(t)
+	if code := Run([]string{"--install", "--channel=stable", "--dry-run"}, d); code != exitOK {
+		t.Fatal(code)
+	}
+	if !strings.Contains(stdout.String(), "channel=stable") {
+		t.Errorf("expected channel=stable in recipe:\n%s", stdout.String())
+	}
+	if strings.Contains(stdout.String(), "/mainline/debian") {
+		t.Errorf("stable channel must not reference mainline URL:\n%s", stdout.String())
+	}
+}
+
+func TestRunInstallRejectsBadChannel(t *testing.T) {
+	d, _, _, _ := defaultDepsFor(t)
+	if code := Run([]string{"--install", "--channel=nightly"}, d); code != exitUserError {
+		t.Errorf("expected exitUserError for bad channel, got %d", code)
+	}
+}
+
+// ---- --brotli-build ----
+
+func TestRunBrotliBuildDryRunPrintsRecipe(t *testing.T) {
+	d, exec, stdout, stderr := defaultDepsFor(t)
+	d.NginxVersion = func() (nginx.VersionInfo, error) {
+		return nginx.VersionInfo{Major: 1, Minor: 31, Patch: 1}, nil
+	}
+
+	code := Run([]string{"--brotli-build", "--dry-run"}, d)
+	if code != exitOK {
+		t.Fatalf("exit=%d stderr=%s", code, stderr)
+	}
+	out := stdout.String()
+	for _, want := range []string{
+		"nginx 1.31.1",
+		"apt-get install",
+		"nginx-1.31.1.tar.gz",
+		"--with-compat",
+		"--add-dynamic-module=../ngx_brotli",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("dry-run output missing %q:\n%s", want, out)
+		}
+	}
+	if exec.called("apt-get") || exec.called("curl") {
+		t.Errorf("dry-run must not exec anything, got %v", exec.calls)
+	}
+}
+
+func TestRunBrotliBuildSkipsIfAlreadyLoaded(t *testing.T) {
+	d, exec, _, stderr := defaultDepsFor(t)
+	d.NginxVersion = func() (nginx.VersionInfo, error) {
+		return nginx.VersionInfo{Major: 1, Minor: 31, Patch: 1}, nil
+	}
+	if err := os.MkdirAll(d.Layout.ModulesEnabledDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	conf := filepath.Join(d.Layout.ModulesEnabledDir, "50-mod-http-brotli.conf")
+	if err := os.WriteFile(conf, []byte("load_module modules/x.so;\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	code := Run([]string{"--brotli-build"}, d)
+	if code != exitOK {
+		t.Fatalf("exit=%d stderr=%s", code, stderr)
+	}
+	if exec.called("apt-get") || exec.called("curl") || exec.called("git") || exec.called("make") {
+		t.Errorf("already-loaded short-circuit must skip build, got calls=%v", exec.calls)
+	}
+	if !strings.Contains(stderr.String(), "already loaded") {
+		t.Errorf("expected 'already loaded' notice:\n%s", stderr.String())
+	}
+}
+
+func TestRunBrotliBuildForceProceedsEvenIfLoaded(t *testing.T) {
+	d, exec, _, _ := defaultDepsFor(t)
+	d.NginxVersion = func() (nginx.VersionInfo, error) {
+		return nginx.VersionInfo{Major: 1, Minor: 31, Patch: 1}, nil
+	}
+	if err := os.MkdirAll(d.Layout.ModulesEnabledDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	_ = os.WriteFile(filepath.Join(d.Layout.ModulesEnabledDir, "brotli.conf"), []byte("x"), 0644)
+
+	// Build will fail at the "read built module" step because fakeExec
+	// doesn't produce real .so files. We only assert that --force bypassed
+	// the early-return guard and reached the apt install step.
+	_ = Run([]string{"--brotli-build", "--force"}, d)
+	if !exec.called("apt-get") {
+		t.Errorf("--force must proceed past early-return, got %v", exec.calls)
+	}
+}
+
+func TestRunBrotliBuildAptInstallFailureExits(t *testing.T) {
+	d, exec, _, stderr := defaultDepsFor(t)
+	d.NginxVersion = func() (nginx.VersionInfo, error) {
+		return nginx.VersionInfo{Major: 1, Minor: 31, Patch: 1}, nil
+	}
+	exec.fail["apt-get"] = errors.New("exit 100")
+	exec.out["apt-get"] = []byte("E: failed to install build-essential\n")
+
+	code := Run([]string{"--brotli-build"}, d)
+	if code != exitSystemErr {
+		t.Fatalf("exit=%d stderr=%s", code, stderr)
+	}
+	if exec.called("curl") {
+		t.Errorf("apt-get failure must short-circuit before download, got %v", exec.calls)
 	}
 }
 

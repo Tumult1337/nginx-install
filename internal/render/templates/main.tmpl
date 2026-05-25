@@ -151,6 +151,11 @@ http {
 
     access_log /var/log/nginx/access.log json buffer=64k flush=5s if=$loggable;
 
-    # Vhosts
+    # Operator-managed http-scope snippets (maps, custom log formats, etc.).
+    # nginx-gen never writes here — drop your own .conf files in conf.d/ and
+    # they will survive --main re-renders.
+    include /etc/nginx/conf.d/*.conf;
+
+    # Vhosts (managed by `nginx-gen <host> <target>`).
     include /etc/nginx/sites-enabled/*.conf;
 }
