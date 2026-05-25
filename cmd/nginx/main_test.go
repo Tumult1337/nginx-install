@@ -82,6 +82,12 @@ func (f fakeHTTP) Get(ctx context.Context, url string) ([]byte, error) { return 
 
 func defaultDepsFor(t *testing.T) (Deps, *fakeExec, *bytes.Buffer, *bytes.Buffer) {
 	t.Helper()
+	// Point the nginx.org sources-list probe at a path under the test's
+	// temp directory so the file-stat check in ensureBrotli is deterministic
+	// regardless of whether the dev host has /etc/apt/sources.list.d/nginx.list
+	// in place. Individual tests can `os.WriteFile(nginxOrgSourcesList, ...)`
+	// to simulate "nginx.org repo configured".
+	overrideNginxOrgSourcesList(t, filepath.Join(t.TempDir(), "nginx.list"))
 	exec := &fakeExec{fail: map[string]error{}, out: map[string][]byte{}}
 	stdout := &bytes.Buffer{}
 	stderr := &bytes.Buffer{}
@@ -99,6 +105,13 @@ func defaultDepsFor(t *testing.T) (Deps, *fakeExec, *bytes.Buffer, *bytes.Buffer
 		Stderr: stderr,
 	}
 	return d, exec, stdout, stderr
+}
+
+func overrideNginxOrgSourcesList(t *testing.T, path string) {
+	t.Helper()
+	orig := nginxOrgSourcesList
+	nginxOrgSourcesList = path
+	t.Cleanup(func() { nginxOrgSourcesList = orig })
 }
 
 func seedCert(t *testing.T, layout Layout, host string) {
@@ -520,6 +533,198 @@ func TestEnsureBrotliFallsThroughWhenProbeInconclusive(t *testing.T) {
 	_ = ensureBrotli(d)
 	if !exec.called("apt-get") {
 		t.Errorf("inconclusive probe should still try apt-get, got calls=%v", exec.calls)
+	}
+}
+
+// Authoritative signal: if nginx.org's apt repo file is present on disk,
+// Debian's pre-built brotli packages are ABI-incompatible by construction.
+// ensureBrotli must skip the apt round-trip entirely — no apt-cache, no
+// dpkg-query, no apt-get — and warn loudly enough that the operator knows
+// to expect a from-source build via --install/--convert/--bootstrap.
+func TestEnsureBrotliSkipsAptWhenNginxOrgRepoConfigured(t *testing.T) {
+	d, exec, _, stderr := defaultDepsFor(t)
+	if err := os.WriteFile(nginxOrgSourcesList,
+		[]byte("deb [signed-by=...] https://nginx.org/packages/mainline/debian trixie nginx\n"),
+		0644); err != nil {
+		t.Fatal(err)
+	}
+
+	if got := ensureBrotli(d); got {
+		t.Errorf("ensureBrotli must return false when nginx.org repo is configured; got true")
+	}
+	for _, c := range exec.calls {
+		switch c[0] {
+		case "apt-get", "apt-cache", "dpkg-query":
+			t.Errorf("nginx.org repo signal must short-circuit before %s, got calls=%v", c[0], exec.calls)
+		}
+	}
+	if !strings.Contains(stderr.String(), "nginx.org apt repo is configured") {
+		t.Errorf("warning should name the nginx.org repo signal:\n%s", stderr.String())
+	}
+}
+
+// Inconclusive-probe paths must each emit a single diagnostic line naming
+// which probe was inconclusive, so a failed apt install logged in stderr
+// can be retroactively explained without re-running on the failed host.
+func TestEnsureBrotliDiagnosesInconclusiveProbe(t *testing.T) {
+	t.Run("apt-cache failed", func(t *testing.T) {
+		d, exec, _, stderr := defaultDepsFor(t)
+		exec.fail["apt-cache"] = errors.New("command not found")
+		_ = ensureBrotli(d)
+		if !strings.Contains(stderr.String(), "apt-cache depends returned no nginx-abi dependency") {
+			t.Errorf("expected diagnostic for apt-cache failure:\n%s", stderr.String())
+		}
+	})
+	t.Run("dpkg-query failed", func(t *testing.T) {
+		d, exec, _, stderr := defaultDepsFor(t)
+		exec.out["apt-cache"] = []byte("libnginx-mod-http-brotli-filter\n  Depends: nginx-abi-1.26.3-1\n")
+		exec.fail["dpkg-query"] = errors.New("exit 1")
+		_ = ensureBrotli(d)
+		if !strings.Contains(stderr.String(), "dpkg-query for installed nginx failed") {
+			t.Errorf("expected diagnostic for dpkg-query failure:\n%s", stderr.String())
+		}
+	})
+}
+
+// On a host where apt+Debian-brotli would silently fail in BrotliAuto mode,
+// runMain (called inside runInstall) returns OK with a brotli-less render.
+// Verifies that the new file-stat probe flips BrotliAuto from "render
+// without brotli" to a warning-only path that's safe to chain a build off.
+func TestRunMainBrotliAutoSkipsAptWhenNginxOrgRepoConfigured(t *testing.T) {
+	d, exec, _, stderr := defaultDepsFor(t)
+	if err := os.WriteFile(nginxOrgSourcesList, []byte("deb ...\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	if code := Run([]string{"--main", "--brotli=auto"}, d); code != exitOK {
+		t.Fatalf("exit=%d stderr=%s", code, stderr)
+	}
+	for _, c := range exec.calls {
+		if c[0] == "apt-get" || c[0] == "apt-cache" || c[0] == "dpkg-query" {
+			t.Errorf("--brotli=auto with nginx.org repo configured must not invoke %s, got %v", c[0], exec.calls)
+		}
+	}
+	b, _ := os.ReadFile(d.Layout.MainConfPath)
+	if bytes.Contains(b, []byte("brotli            on;")) {
+		t.Errorf("rendered conf must not enable brotli when nginx.org repo blocks Debian packages:\n%s", b)
+	}
+}
+
+// ---- chainBrotliBuildIfNeeded ----
+
+// Helper: seed enough on-disk state for runMain (invoked by the chain when
+// the module is loaded) to succeed. Tests assert against this after the
+// chain runs.
+func seedForChainTest(t *testing.T, d Deps) {
+	t.Helper()
+	for _, dir := range []string{
+		d.Layout.ModulesEnabledDir,
+		filepath.Dir(d.Layout.MainConfPath),
+		filepath.Dir(d.Layout.LockPath),
+		d.Layout.BackupDir,
+	} {
+		if err := os.MkdirAll(dir, 0755); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+func TestChainBrotliBuildIfNeededOffIsNoOp(t *testing.T) {
+	d, _, _, _ := defaultDepsFor(t)
+	seedForChainTest(t, d)
+	called := false
+	build := func(_ Deps, _, _ bool) int { called = true; return exitOK }
+
+	if code := chainBrotliBuildIfNeeded(d, BrotliOff, false, build); code != exitOK {
+		t.Fatalf("exit=%d", code)
+	}
+	if called {
+		t.Errorf("BrotliOff must not invoke build")
+	}
+	if _, err := os.Stat(d.Layout.MainConfPath); err == nil {
+		t.Errorf("BrotliOff must not render nginx.conf via chain")
+	}
+}
+
+func TestChainBrotliBuildIfNeededAutoSkipsBuildWhenLoaded(t *testing.T) {
+	d, _, _, _ := defaultDepsFor(t)
+	seedForChainTest(t, d)
+	// Module pre-loaded (e.g. user is rerunning --install on a host that
+	// already has brotli compiled from a prior run).
+	if err := os.WriteFile(
+		filepath.Join(d.Layout.ModulesEnabledDir, brotliLoadConf),
+		[]byte("load_module modules/ngx_http_brotli_filter_module.so;\n"), 0644,
+	); err != nil {
+		t.Fatal(err)
+	}
+	called := false
+	build := func(_ Deps, _, _ bool) int { called = true; return exitOK }
+
+	if code := chainBrotliBuildIfNeeded(d, BrotliAuto, false, build); code != exitOK {
+		t.Fatalf("exit=%d", code)
+	}
+	if called {
+		t.Errorf("already-loaded short-circuit must skip build")
+	}
+	// Re-render must have run so the loaded module is referenced in
+	// nginx.conf (covers the first-pass-was-BrotliOff scenario).
+	b, _ := os.ReadFile(d.Layout.MainConfPath)
+	if !bytes.Contains(b, []byte("brotli            on;")) {
+		t.Errorf("re-render must enable brotli when module is loaded:\n%s", b)
+	}
+}
+
+func TestChainBrotliBuildIfNeededAutoBuildsThenRenders(t *testing.T) {
+	d, _, _, _ := defaultDepsFor(t)
+	seedForChainTest(t, d)
+	// Fake build: writes the load_module conf, simulating a successful
+	// from-source compile. The chain must detect the new module and
+	// re-render nginx.conf with brotli enabled.
+	build := func(d Deps, _, _ bool) int {
+		err := os.WriteFile(
+			filepath.Join(d.Layout.ModulesEnabledDir, brotliLoadConf),
+			[]byte("load_module modules/ngx_http_brotli_filter_module.so;\n"),
+			0644,
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return exitOK
+	}
+
+	if code := chainBrotliBuildIfNeeded(d, BrotliAuto, false, build); code != exitOK {
+		t.Fatalf("exit=%d", code)
+	}
+	b, _ := os.ReadFile(d.Layout.MainConfPath)
+	if !bytes.Contains(b, []byte("brotli            on;")) {
+		t.Errorf("auto+build-success must render brotli directives:\n%s", b)
+	}
+}
+
+func TestChainBrotliBuildIfNeededAutoSoftFailsOnBuildErr(t *testing.T) {
+	d, _, _, stderr := defaultDepsFor(t)
+	seedForChainTest(t, d)
+	build := func(_ Deps, _, _ bool) int { return exitSystemErr }
+
+	if code := chainBrotliBuildIfNeeded(d, BrotliAuto, false, build); code != exitOK {
+		t.Fatalf("BrotliAuto must soft-fail on build error, got exit=%d", code)
+	}
+	if !strings.Contains(stderr.String(), "brotli-build failed") {
+		t.Errorf("expected warning naming brotli-build failure:\n%s", stderr.String())
+	}
+	// Module never appeared → no re-render → no nginx.conf written.
+	if _, err := os.Stat(d.Layout.MainConfPath); err == nil {
+		t.Errorf("soft-fail must leave first-pass render intact; chain must not write nginx.conf")
+	}
+}
+
+func TestChainBrotliBuildIfNeededOnHardFailsOnBuildErr(t *testing.T) {
+	d, _, _, _ := defaultDepsFor(t)
+	seedForChainTest(t, d)
+	build := func(_ Deps, _, _ bool) int { return exitSystemErr }
+
+	if code := chainBrotliBuildIfNeeded(d, BrotliOn, false, build); code == exitOK {
+		t.Errorf("BrotliOn must hard-fail on build error, got exit=%d", code)
 	}
 }
 

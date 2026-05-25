@@ -1379,12 +1379,16 @@ func runBootstrap(d Deps, channelStr string, brotliMode BrotliMode, dryRun, forc
 // ---- install ----
 
 const (
-	nginxOrgKeyURL      = "https://nginx.org/keys/nginx_signing.key"
-	nginxOrgKeyring     = "/usr/share/keyrings/nginx-archive-keyring.gpg"
-	nginxOrgSourcesList = "/etc/apt/sources.list.d/nginx.list"
-	nginxOrgPrefs       = "/etc/apt/preferences.d/99nginx"
-	upstreamStubConf    = "/etc/nginx/conf.d/default.conf"
+	nginxOrgKeyURL   = "https://nginx.org/keys/nginx_signing.key"
+	nginxOrgKeyring  = "/usr/share/keyrings/nginx-archive-keyring.gpg"
+	nginxOrgPrefs    = "/etc/apt/preferences.d/99nginx"
+	upstreamStubConf = "/etc/nginx/conf.d/default.conf"
 )
+
+// Overridable for tests; presence of this file is the authoritative signal
+// that nginx came from nginx.org (and therefore Debian's pre-built brotli
+// packages are ABI-incompatible). Production code never reassigns it.
+var nginxOrgSourcesList = "/etc/apt/sources.list.d/nginx.list"
 
 type nginxChannel string
 
@@ -1490,23 +1494,8 @@ func runInstall(d Deps, channelStr string, brotliMode BrotliMode, dryRun, userFo
 		return code
 	}
 
-	// --brotli=on: ensure the module is present (build from source if not —
-	// the only path that works on nginx.org, where Debian's pre-built brotli
-	// packages are ABI-incompatible), then re-render so the brotli
-	// directives actually appear in nginx.conf. The re-render runs
-	// unconditionally on rerun even if the module is already loaded —
-	// otherwise the first-pass BrotliOff render would be the final state
-	// and the loaded module would sit there inert.
-	if brotliMode == BrotliOn {
-		if !brotliModuleLoaded(d.Layout.ModulesEnabledDir) {
-			fmt.Fprintln(d.Stderr, "compiling brotli module against the just-installed nginx...")
-			if code := runBrotliBuild(d, userForce, false); code != exitOK {
-				return code
-			}
-		}
-		if code := runMain(d, true, false, true, BrotliOn); code != exitOK {
-			return code
-		}
+	if code := chainBrotliBuildIfNeeded(d, brotliMode, userForce, runBrotliBuild); code != exitOK {
+		return code
 	}
 
 	// Validate the assembled config before we drop service via restart.
@@ -1536,6 +1525,45 @@ func runInstall(d Deps, channelStr string, brotliMode BrotliMode, dryRun, userFo
 		"brotli":  brotliMode.String(),
 		"result":  "ok",
 	})
+	return exitOK
+}
+
+// chainBrotliBuildIfNeeded is the install-flow successor to runMain's apt
+// path. Called after the first runMain pass; if the brotli module isn't
+// already loaded (either because the apt path failed/was-skipped or because
+// it's a fresh host), this builds the module from source and re-renders
+// nginx.conf with brotli directives.
+//
+//	BrotliOff  → no-op.
+//	BrotliOn   → required: build failure aborts the install.
+//	BrotliAuto → opportunistic: build failure leaves the brotli-less render
+//	             from the first pass intact and returns exitOK with a warning.
+//
+// The build function is injected so unit tests can simulate success (fake
+// writes the load_module conf) or failure (returns non-zero) without
+// invoking apt-get + cmake + git clone. Production passes runBrotliBuild.
+//
+// The terminal re-render runs unconditionally when the module is loaded so
+// reruns on a host where the first-pass render is brotli-less but the
+// module is already on disk converge to a brotli-enabled nginx.conf.
+func chainBrotliBuildIfNeeded(d Deps, mode BrotliMode, userForce bool, build func(Deps, bool, bool) int) int {
+	if mode == BrotliOff {
+		return exitOK
+	}
+	if !brotliModuleLoaded(d.Layout.ModulesEnabledDir) {
+		fmt.Fprintln(d.Stderr, "compiling brotli module against the just-installed nginx...")
+		if code := build(d, userForce, false); code != exitOK {
+			if mode == BrotliOn {
+				return code
+			}
+			fmt.Fprintln(d.Stderr, "warning: brotli-build failed; continuing without brotli (--brotli=auto)")
+		}
+	}
+	if brotliModuleLoaded(d.Layout.ModulesEnabledDir) {
+		if code := runMain(d, true, false, true, BrotliOn); code != exitOK {
+			return code
+		}
+	}
 	return exitOK
 }
 
@@ -1613,8 +1641,11 @@ func printInstallRecipe(w io.Writer, channel nginxChannel, mode BrotliMode) {
 	fmt.Fprintf(w, "rm %s   # remove upstream stub server\n", upstreamStubConf)
 	fmt.Fprintln(w, "mkdir -p /etc/nginx/{sites-available,sites-enabled,modules,modules-enabled}")
 	fmt.Fprintln(w, "render /etc/nginx/nginx.conf via --main (brotli="+mode.String()+")")
-	if mode == BrotliOn {
-		fmt.Fprintln(w, "[--brotli=on] would also chain --brotli-build if module is absent")
+	switch mode {
+	case BrotliOn:
+		fmt.Fprintln(w, "[--brotli=on]   chain --brotli-build (required; abort install if it fails)")
+	case BrotliAuto:
+		fmt.Fprintln(w, "[--brotli=auto] chain --brotli-build if module not loaded (best-effort; soft-fail)")
 	}
 	fmt.Fprintln(w, "systemctl enable --now nginx && systemctl restart nginx")
 }
@@ -1764,19 +1795,41 @@ func ensureBrotli(d Deps) bool {
 	if brotliModuleLoaded(d.Layout.ModulesEnabledDir) {
 		return true
 	}
-	if required := brotliABIRequired(d.Exec); required != "" {
-		if provides, ok := nginxProvidesABI(d.Exec); ok {
-			if _, has := provides[required]; !has {
-				have := make([]string, 0, len(provides))
-				for p := range provides {
-					have = append(have, p)
-				}
-				slices.Sort(have)
-				fmt.Fprintf(d.Stderr, "warning: brotli unavailable: Debian brotli packages require %s but installed nginx provides %v\n", required, have)
-				fmt.Fprintln(d.Stderr, "       this commonly means nginx was installed from nginx.org instead of Debian.")
-				fmt.Fprintln(d.Stderr, "       rendering nginx.conf without brotli; pass --brotli=off to silence this.")
-				return false
+	// Authoritative signal: if nginx.org's apt repo file is present, the
+	// installed nginx is from nginx.org and Debian's pre-built brotli
+	// packages cannot satisfy their `nginx-abi-X.Y.Z-N` virtual-package
+	// dependency — they're guaranteed to fail. Skip the apt round-trip.
+	// Production code only writes this file via ensureNginxOrgRepo, so its
+	// presence is a reliable proxy for "we (or the operator) configured the
+	// upstream channel".
+	if _, err := os.Stat(nginxOrgSourcesList); err == nil {
+		fmt.Fprintln(d.Stderr, "warning: brotli unavailable: nginx.org apt repo is configured ("+nginxOrgSourcesList+") — Debian's pre-built brotli packages are ABI-incompatible with nginx.org's nginx.")
+		fmt.Fprintln(d.Stderr, "       rendering nginx.conf without brotli. --install/--convert/--bootstrap will auto-compile brotli from source unless --brotli=off.")
+		return false
+	}
+	// Fallback probe: parse `apt-cache depends` + `dpkg-query Provides` for
+	// hosts where the operator wired up nginx.org outside our managed path
+	// (or removed our sources.list file). Inconclusive on either side falls
+	// through to a real apt-get install attempt — the prior behavior — but
+	// we now name which probe was inconclusive so failures are debuggable
+	// from the on-disk log without re-running.
+	required := brotliABIRequired(d.Exec)
+	if required == "" {
+		fmt.Fprintln(d.Stderr, "note: brotli ABI probe inconclusive (apt-cache depends returned no nginx-abi dependency); attempting apt install")
+	} else {
+		provides, ok := nginxProvidesABI(d.Exec)
+		if !ok {
+			fmt.Fprintln(d.Stderr, "note: brotli ABI probe inconclusive (dpkg-query for installed nginx failed); attempting apt install")
+		} else if _, has := provides[required]; !has {
+			have := make([]string, 0, len(provides))
+			for p := range provides {
+				have = append(have, p)
 			}
+			slices.Sort(have)
+			fmt.Fprintf(d.Stderr, "warning: brotli unavailable: Debian brotli packages require %s but installed nginx provides %v\n", required, have)
+			fmt.Fprintln(d.Stderr, "       this commonly means nginx was installed from nginx.org instead of Debian.")
+			fmt.Fprintln(d.Stderr, "       rendering nginx.conf without brotli; pass --brotli=off to silence this.")
+			return false
 		}
 	}
 	fmt.Fprintln(d.Stderr, "installing brotli packages via apt-get (this may take a moment)...")
