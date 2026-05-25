@@ -1,6 +1,7 @@
 BINARY  := nginx-gen
 PREFIX  ?= /usr/local
-GOFLAGS := -trimpath -ldflags="-s -w"
+VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
+GOFLAGS := -trimpath -ldflags="-s -w -X main.toolVersion=$(VERSION)"
 
 .PHONY: all build test vet race clean install
 

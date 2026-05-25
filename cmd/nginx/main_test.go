@@ -611,11 +611,11 @@ func TestWriteRollbackScriptUnknownVersion(t *testing.T) {
 	}
 }
 
-// ---- --upgrade / --version-check ----
+// ---- --nginx-upgrade / --abi-check ----
 
 func TestRunUpgradeDryRunPrintsRecipe(t *testing.T) {
 	d, exec, stdout, stderr := defaultDepsFor(t)
-	if code := Run([]string{"--upgrade", "--dry-run"}, d); code != exitOK {
+	if code := Run([]string{"--nginx-upgrade", "--dry-run"}, d); code != exitOK {
 		t.Fatalf("exit=%d stderr=%s", code, stderr)
 	}
 	for _, want := range []string{
@@ -665,7 +665,7 @@ func TestBrotliBuildVersionEmptyOnHandWritten(t *testing.T) {
 func TestRunVersionCheckNoBrotli(t *testing.T) {
 	d, exec, stdout, _ := defaultDepsFor(t)
 	exec.out["nginx"] = []byte("nginx version: nginx/1.31.1\n")
-	if code := Run([]string{"--version-check"}, d); code != exitOK {
+	if code := Run([]string{"--abi-check"}, d); code != exitOK {
 		t.Fatalf("exit=%d stdout=%s", code, stdout)
 	}
 	if !strings.Contains(stdout.String(), "nginx: 1.31.1") {
@@ -688,7 +688,7 @@ func TestRunVersionCheckInSync(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if code := Run([]string{"--version-check"}, d); code != exitOK {
+	if code := Run([]string{"--abi-check"}, d); code != exitOK {
 		t.Fatalf("expected exitOK, got %d stdout=%s", code, stdout)
 	}
 	if !strings.Contains(stdout.String(), "(in sync)") {
@@ -708,7 +708,7 @@ func TestRunVersionCheckDrift(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	code := Run([]string{"--version-check"}, d)
+	code := Run([]string{"--abi-check"}, d)
 	if code != exitUserError {
 		t.Fatalf("expected exit 1 on drift, got %d stdout=%s", code, stdout)
 	}

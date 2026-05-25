@@ -78,9 +78,10 @@ nginx-gen --install       [--channel=mainline|stable] [--brotli=auto|on|off]
     Add nginx.org apt repo, install nginx, render managed nginx.conf,
     optionally build brotli. Skips --sysctl.
 
-nginx-gen --upgrade       [--force] [--dry-run] [--no-reload]
-    apt-upgrade nginx, auto-rebuild brotli if version drifted, re-render
-    nginx.conf, restart. Idempotent: no-op when nothing changed.
+nginx-gen --nginx-upgrade [--force] [--dry-run] [--no-reload]
+    apt-upgrade the nginx package, auto-rebuild brotli if version drifted,
+    re-render nginx.conf, restart. Idempotent: no-op when nothing changed.
+    NOTE: this upgrades nginx, not the nginx-gen tool itself — see --self-update.
 
 nginx-gen --convert       [--channel=mainline|stable] [--brotli=auto|on|off]
                           [--dry-run] [--no-reload]
@@ -89,9 +90,18 @@ nginx-gen --convert       [--channel=mainline|stable] [--brotli=auto|on|off]
     an executable rollback.sh BEFORE touching anything, then runs --install
     + --sysctl. On any failure, prints the rollback command prominently.
 
-nginx-gen --version-check
+nginx-gen --abi-check
     Print nginx + brotli ABI sync status. Exit 0 if in sync, 1 on drift.
     Suitable for cron / monit / Nagios.
+
+nginx-gen --self-update   [--force] [--dry-run]
+    Replace this nginx-gen binary with the latest GitHub release
+    (verified by sha256 against the release's checksums.txt). Downloads
+    the raw binary for the current GOOS/GOARCH, atomically swaps it in
+    over the currently-running executable's path. Does NOT touch nginx.
+
+nginx-gen --version
+    Print nginx-gen tool version and exit.
 
 nginx-gen --brotli-build  [--force] [--dry-run]
     Compile ngx_brotli dynamic modules against the installed nginx and
@@ -157,8 +167,8 @@ There are three sources of the module:
 **ABI drift after nginx upgrade.** The compiled `.so` is pinned to the exact
 nginx version it was built against (nginx checks at startup). After
 `apt upgrade nginx`, `nginx -t` will error with *"module … not binary
-compatible"* until brotli is rebuilt. Use `--upgrade` (handles both) or
-`--brotli-build --force` (brotli only). `--version-check` reports drift
+compatible"* until brotli is rebuilt. Use `--nginx-upgrade` (handles both) or
+`--brotli-build --force` (brotli only). `--abi-check` reports drift
 without doing anything; exit 1 = needs rebuild.
 
 ## Custom snippets (`conf.d/`)
@@ -172,7 +182,7 @@ include /etc/nginx/sites-enabled/*.conf; # nginx-gen-managed vhosts
 
 Drop http-scope snippets (`map`, custom `log_format`, `geo`, additional
 `upstream` blocks, etc.) into `/etc/nginx/conf.d/<sortable-name>.conf` and
-they survive every `--main` / `--upgrade` re-render.
+they survive every `--main` / `--nginx-upgrade` re-render.
 
 Example — language routing map:
 
@@ -244,18 +254,27 @@ enough). `modprobe tcp_bbr` if not already loaded.
 
 ```cron
 # /etc/cron.d/nginx-gen-check
-0 6 * * 1 root /usr/local/bin/nginx-gen --version-check > /var/log/nginx-gen-check.log 2>&1 || \
+0 6 * * 1 root /usr/local/bin/nginx-gen --abi-check > /var/log/nginx-gen-check.log 2>&1 || \
   mail -s "nginx-gen drift" root < /var/log/nginx-gen-check.log
 ```
 
 **Patch nginx (CVE response):**
 
 ```bash
-nginx-gen --upgrade
+sudo nginx-gen --nginx-upgrade
 ```
 
 That's it. Apt-upgrades nginx, rebuilds brotli if version drifted, re-renders,
 runs `nginx -t`, restarts.
+
+**Update the nginx-gen tool itself:**
+
+```bash
+sudo nginx-gen --self-update
+```
+
+Downloads the latest release binary from GitHub, verifies its sha256, and
+atomically replaces the running executable. Does not touch nginx.
 
 **Prune old backups:**
 
@@ -320,8 +339,9 @@ sudo nginx-gen --convert --brotli=on --dry-run
 ```bash
 # Lifecycle
 sudo nginx-gen --bootstrap --brotli=on              # fresh host
-sudo nginx-gen --upgrade                             # patch nginx + rebuild brotli
-sudo nginx-gen --version-check                       # cron-friendly status
+sudo nginx-gen --nginx-upgrade                       # patch nginx + rebuild brotli
+sudo nginx-gen --self-update                         # patch the nginx-gen tool
+sudo nginx-gen --abi-check                           # cron-friendly status
 
 # Per-vhost (proxy)
 sudo nginx-gen api.example.com 10.0.0.5:8080
@@ -392,11 +412,11 @@ For every write:
 3. Atomic-write the new contents (tmp + fsync + rename).
 4. Run `nginx -t`. **On failure: restore the backup (or remove if first deploy)
    and unlink any new symlink.** Exit 3.
-5. Run `systemctl reload nginx` (or `restart` after `--sysctl`/`--upgrade`).
+5. Run `systemctl reload nginx` (or `restart` after `--sysctl`/`--nginx-upgrade`).
    **Reload/restart failures do NOT roll back** — the config is valid;
    runtime failure is a separate concern.
 
-`--bootstrap`/`--install`/`--upgrade` add a final `nginx -t` before
+`--bootstrap`/`--install`/`--nginx-upgrade` add a final `nginx -t` before
 `systemctl restart`, so a broken assembled state surfaces as exit 3 with
 the old nginx still running, not as a failed restart with nginx down.
 
@@ -405,7 +425,7 @@ the old nginx still running, not as a failed restart with nginx down.
 | Code | Meaning |
 |---   |---      |
 | 0    | OK |
-| 1    | User error (bad input, refused, `--version-check` drift) |
+| 1    | User error (bad input, refused, `--abi-check` drift) |
 | 2    | System error (FS, exec, network) |
 | 3    | `nginx -t` failed; rolled back |
 

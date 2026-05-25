@@ -73,6 +73,7 @@ type Deps struct {
 	Layout       Layout
 	Exec         nginx.Execer
 	HTTP         cf.HTTPGetter
+	ReleaseHTTP  httpGetter // for --self-update; longer timeout, GitHub-friendly headers
 	Now          func() time.Time
 	Stdout       io.Writer
 	Stderr       io.Writer
@@ -82,12 +83,13 @@ type Deps struct {
 func DefaultDeps() Deps {
 	exec := nginx.RealExecer{}
 	return Deps{
-		Layout: DefaultLayout(),
-		Exec:   exec,
-		HTTP:   cf.DefaultConfig().HTTP,
-		Now:    time.Now,
-		Stdout: os.Stdout,
-		Stderr: os.Stderr,
+		Layout:      DefaultLayout(),
+		Exec:        exec,
+		HTTP:        cf.DefaultConfig().HTTP,
+		ReleaseHTTP: releaseHTTP{},
+		Now:         time.Now,
+		Stdout:      os.Stdout,
+		Stderr:      os.Stderr,
 		NginxVersion: sync.OnceValues(func() (nginx.VersionInfo, error) {
 			return nginx.Version(exec)
 		}),
@@ -116,9 +118,11 @@ func Run(args []string, d Deps) int {
 	doBrotliBuild := fs.Bool("brotli-build", false, "compile ngx_brotli dynamic modules against the installed nginx (for hosts where the Debian brotli packages are ABI-incompatible)")
 	doInstall := fs.Bool("install", false, "bootstrap a fresh nginx install: add nginx.org repo, apt-get install nginx, render managed nginx.conf, optionally build brotli")
 	doBootstrap := fs.Bool("bootstrap", false, "first-time host setup: --install + --sysctl in one shot (idempotent, safe to rerun)")
-	doUpgrade   := fs.Bool("upgrade", false, "apt-upgrade nginx, rebuild brotli if version drifted, re-render nginx.conf, restart")
-	doVersionCheck := fs.Bool("version-check", false, "print nginx + brotli ABI sync status; exit 1 on drift (suitable for cron/nagios)")
+	doNginxUpgrade := fs.Bool("nginx-upgrade", false, "apt-upgrade the nginx package, rebuild brotli if version drifted, re-render nginx.conf, restart. (Does NOT touch the nginx-gen tool — use --self-update for that.)")
+	doABICheck := fs.Bool("abi-check", false, "print nginx + brotli ABI sync status; exit 1 on drift (suitable for cron/nagios)")
 	doConvert := fs.Bool("convert", false, "best-effort migration of an existing (Debian/other) nginx install into nginx-gen's managed setup; snapshots /etc/nginx + writes a rollback script before touching anything")
+	doSelfUpdate := fs.Bool("self-update", false, "replace this nginx-gen binary with the latest GitHub release (verified by sha256). Does NOT touch nginx itself — use --nginx-upgrade for that.")
+	doVersion := fs.Bool("version", false, "print nginx-gen tool version and exit")
 	channel  := fs.String("channel", "mainline", "nginx.org channel: mainline | stable (only used with --install / --bootstrap)")
 	useSSL   := fs.Bool("ssl", true, "enable SSL listener (HTTP→HTTPS redirect + 443)")
 	allowFlag := fs.String("allow", "", "cf | comma-separated CIDRs (or bare IPs)")
@@ -192,18 +196,18 @@ func Run(args []string, d Deps) int {
 			return exitUserError
 		}
 		return runBootstrap(d, *channel, mode, *dryRun, *force, *noReload)
-	case *doUpgrade:
+	case *doNginxUpgrade:
 		if len(pos) != 0 {
-			fmt.Fprintln(d.Stderr, "usage: nginx-gen --upgrade  (no positional args)")
+			fmt.Fprintln(d.Stderr, "usage: nginx-gen --nginx-upgrade  (no positional args)")
 			return exitUserError
 		}
-		return runUpgrade(d, *dryRun, *force, *noReload)
-	case *doVersionCheck:
+		return runNginxUpgrade(d, *dryRun, *force, *noReload)
+	case *doABICheck:
 		if len(pos) != 0 {
-			fmt.Fprintln(d.Stderr, "usage: nginx-gen --version-check  (no positional args)")
+			fmt.Fprintln(d.Stderr, "usage: nginx-gen --abi-check  (no positional args)")
 			return exitUserError
 		}
-		return runVersionCheck(d)
+		return runABICheck(d)
 	case *doConvert:
 		if len(pos) != 0 {
 			fmt.Fprintln(d.Stderr, "usage: nginx-gen --convert  (no positional args)")
@@ -215,6 +219,18 @@ func Run(args []string, d Deps) int {
 			return exitUserError
 		}
 		return runConvert(d, *channel, mode, *dryRun, *noReload)
+	case *doSelfUpdate:
+		if len(pos) != 0 {
+			fmt.Fprintln(d.Stderr, "usage: nginx-gen --self-update  [--force] [--dry-run]")
+			return exitUserError
+		}
+		return runSelfUpdate(d, *dryRun, *force)
+	case *doVersion:
+		if len(pos) != 0 {
+			fmt.Fprintln(d.Stderr, "usage: nginx-gen --version  (no positional args)")
+			return exitUserError
+		}
+		return runVersion(d)
 	}
 
 	// Vhost mode
@@ -237,9 +253,11 @@ func printUsage(w io.Writer) {
 	fmt.Fprintln(w, "  nginx-gen --brotli-build  [--force] [--dry-run]")
 	fmt.Fprintln(w, "  nginx-gen --install    [--channel=mainline|stable] [--brotli=auto|on|off] [--force] [--dry-run]")
 	fmt.Fprintln(w, "  nginx-gen --bootstrap  [--channel=mainline|stable] [--brotli=auto|on|off] [--force] [--dry-run] [--no-reload]")
-	fmt.Fprintln(w, "  nginx-gen --upgrade    [--force] [--dry-run] [--no-reload]")
-	fmt.Fprintln(w, "  nginx-gen --version-check   (exit 0 if nginx+brotli ABIs match; 1 on drift)")
+	fmt.Fprintln(w, "  nginx-gen --nginx-upgrade  [--force] [--dry-run] [--no-reload]")
+	fmt.Fprintln(w, "  nginx-gen --abi-check       (exit 0 if nginx+brotli ABIs match; 1 on drift)")
 	fmt.Fprintln(w, "  nginx-gen --convert    [--channel=mainline|stable] [--brotli=auto|on|off] [--dry-run] [--no-reload]")
+	fmt.Fprintln(w, "  nginx-gen --self-update  [--force] [--dry-run]")
+	fmt.Fprintln(w, "  nginx-gen --version")
 }
 
 // ---- vhost ----
@@ -940,18 +958,18 @@ func brotliBuildVersion(modulesEnabledDir string) string {
 	return string(m[1])
 }
 
-// runUpgrade applies apt upgrades to nginx, rebuilds brotli if the new
+// runNginxUpgrade applies apt upgrades to nginx, rebuilds brotli if the new
 // nginx version differs from what brotli was compiled against, re-renders
 // nginx.conf (in case the template was updated alongside the binary), and
 // restarts. Idempotent: a no-op apt + matching brotli version + already-
 // managed conf exits in ~2 s with nothing changed.
-func runUpgrade(d Deps, dryRun, force, noReload bool) int {
+func runNginxUpgrade(d Deps, dryRun, force, noReload bool) int {
 	if dryRun {
-		printUpgradeRecipe(d.Stdout)
+		printNginxUpgradeRecipe(d.Stdout)
 		return exitOK
 	}
 	if os.Geteuid() != 0 {
-		fmt.Fprintln(d.Stderr, "--upgrade requires root (apt-get + writes to /etc)")
+		fmt.Fprintln(d.Stderr, "--nginx-upgrade requires root (apt-get + writes to /etc)")
 		return exitUserError
 	}
 
@@ -1030,7 +1048,7 @@ func runUpgrade(d Deps, dryRun, force, noReload bool) int {
 		}
 	}
 
-	logEvent(d.Stderr, d.Now(), "upgrade", "", map[string]any{
+	logEvent(d.Stderr, d.Now(), "nginx-upgrade", "", map[string]any{
 		"nginx_from":     preVer,
 		"nginx_to":       postVer,
 		"brotli_rebuilt": needRebuild,
@@ -1046,7 +1064,7 @@ func cmpOrFallback(s, fallback string) string {
 	return s
 }
 
-func printUpgradeRecipe(w io.Writer) {
+func printNginxUpgradeRecipe(w io.Writer) {
 	fmt.Fprintln(w, "# would upgrade nginx + rebuild brotli if version drifted")
 	fmt.Fprintln(w, "apt-get update")
 	fmt.Fprintln(w, "apt-get install --only-upgrade -y nginx")
@@ -1058,9 +1076,9 @@ func printUpgradeRecipe(w io.Writer) {
 	fmt.Fprintln(w, "systemctl restart nginx")
 }
 
-// runVersionCheck reports nginx ↔ brotli ABI sync status. Exit 0 if no
+// runABICheck reports nginx ↔ brotli ABI sync status. Exit 0 if no
 // drift; exit 1 if a rebuild is needed. Designed for cron/monit/Nagios.
-func runVersionCheck(d Deps) int {
+func runABICheck(d Deps) int {
 	vi, err := nginx.Version(d.Exec)
 	if err != nil {
 		fmt.Fprintln(d.Stderr, "nginx version probe:", err)
@@ -1083,7 +1101,7 @@ func runVersionCheck(d Deps) int {
 		return exitOK
 	}
 	fmt.Fprintf(d.Stdout,
-		"brotli built against: %s  DRIFT — nginx is %s. Run `nginx-gen --upgrade` (or `--brotli-build --force`).\n",
+		"brotli built against: %s  DRIFT — nginx is %s. Run `nginx-gen --nginx-upgrade` (or `--brotli-build --force`).\n",
 		builtVer, nginxVer)
 	return exitUserError
 }
@@ -1136,7 +1154,7 @@ func runConvert(d Deps, channelStr string, brotliMode BrotliMode, dryRun, noRelo
 	if data, err := os.ReadFile(d.Layout.MainConfPath); err == nil {
 		if bytes.HasPrefix(data, []byte(marker.FirstLine)) {
 			fmt.Fprintln(d.Stderr, "nginx.conf already managed by nginx-gen — nothing to convert.")
-			fmt.Fprintln(d.Stderr, "       use --upgrade to refresh, or --main to re-render.")
+			fmt.Fprintln(d.Stderr, "       use --nginx-upgrade to refresh, or --main to re-render.")
 			return exitOK
 		}
 	}

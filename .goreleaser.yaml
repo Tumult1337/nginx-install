@@ -15,7 +15,7 @@ builds:
     flags:
       - -trimpath
     ldflags:
-      - -s -w
+      - -s -w -X main.toolVersion=v{{ .Version }}
     goos:
       - linux
       - darwin
