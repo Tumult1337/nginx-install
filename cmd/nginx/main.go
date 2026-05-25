@@ -243,9 +243,10 @@ func Run(args []string, d Deps) int {
 
 func printUsage(w io.Writer) {
 	fmt.Fprintln(w, "Usage:")
-	fmt.Fprintln(w, "  nginx-gen [--ssl=true|false] [--allow=cf|cidrs] [--force] [--dry-run] [--no-reload] <host> <target>")
-	fmt.Fprintln(w, "    target = ip[:port] | host[:port]   (proxy mode)")
-	fmt.Fprintln(w, "           = /absolute/path/to/htmldir (static mode, must exist)")
+	fmt.Fprintln(w, "  nginx-gen [--ssl=true|false] [--allow=cf|cidrs] [--cert-dir=DIR] [--force] [--dry-run] [--no-reload] <host> <target>")
+	fmt.Fprintln(w, "    target   = ip[:port] | host[:port]   (proxy mode)")
+	fmt.Fprintln(w, "             = /absolute/path/to/htmldir (static mode, must exist)")
+	fmt.Fprintln(w, "    cert-dir = lookup base for <host>/fullchain.pem (default: $NGINX_CERT_DIR or /etc/letsencrypt/live)")
 	fmt.Fprintln(w, "  nginx-gen --main [--brotli=auto|on|off] [--force] [--dry-run] [--no-reload]")
 	fmt.Fprintln(w, "  nginx-gen --remove <host>")
 	fmt.Fprintln(w, "  nginx-gen --list")
