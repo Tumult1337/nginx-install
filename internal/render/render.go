@@ -51,23 +51,34 @@ func (a AllowSpec) String() string {
 }
 
 type VhostCfg struct {
-	Host         string
-	Mode         Mode
-	SSL          bool
-	CertDir      string // resolved (post auto-detect): /etc/letsencrypt/live/<somedomain>
-	Allow        AllowSpec
-	AllowCIDRs   []netip.Prefix // when Allow == AllowList
-	Upstream     string         // "host:port" — for proxy mode (IPv6 already bracketed)
-	UpstreamName string         // safe identifier for `upstream {}` block
-	Root         string         // absolute existing dir — for static mode
-	Now          time.Time      // injectable for golden tests
-	HTTP2Inline  bool           // true → emit `listen 443 ssl http2;` (nginx < 1.25.1)
+	Host           string
+	Mode           Mode
+	SSL            bool
+	CertDir        string // resolved (post auto-detect): /etc/letsencrypt/live/<somedomain>
+	Allow          AllowSpec
+	AllowCIDRs     []netip.Prefix // when Allow == AllowList
+	Upstream       string         // "host:port" — for proxy mode (IPv6 already bracketed)
+	UpstreamName   string         // safe identifier for `upstream {}` block
+	UpstreamSSL    bool           // true → proxy_pass https:// (TLS to the backend)
+	UpstreamVerify bool           // true → verify the backend cert (proxy_ssl_verify on)
+	Root           string         // absolute existing dir — for static mode
+	Now            time.Time      // injectable for golden tests
+	HTTP2Inline    bool           // true → emit `listen 443 ssl http2;` (nginx < 1.25.1)
 }
 
 // Template-friendly accessors. text/template can't compare against AllowSpec
 // constants from outside the package, so expose booleans instead.
 func (c VhostCfg) IsCF() bool   { return c.Allow == AllowCF }
 func (c VhostCfg) IsList() bool { return c.Allow == AllowList && len(c.AllowCIDRs) > 0 }
+
+// UpstreamProto returns the scheme for proxy_pass: "https" when TLS to the
+// backend is requested, else "http".
+func (c VhostCfg) UpstreamProto() string {
+	if c.UpstreamSSL {
+		return "https"
+	}
+	return "http"
+}
 
 func (c VhostCfg) allowField() string {
 	switch c.Allow {

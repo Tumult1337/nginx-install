@@ -115,10 +115,15 @@ nginx-gen --main          [--brotli=auto|on|off] [--force] [--dry-run] [--no-rel
     Render only /etc/nginx/nginx.conf.
 
 # ---- per-vhost ----
-nginx-gen [--ssl] [--allow=cf|cidrs] [--cert-dir=...] [--force]
-          [--dry-run] [--no-reload] <host> <target>
-    target = ip[:port] | host[:port]   → proxy mode
-           = /absolute/path/to/htmldir → static mode (path must exist)
+nginx-gen [--ssl] [--proxy-ssl-verify] [--allow=cf|cidrs] [--cert-dir=...]
+          [--force] [--dry-run] [--no-reload] <host> <target>
+    target = [http://|https://]ip[:port]   → proxy mode
+           = [http://|https://]host[:port] → proxy mode
+           = /absolute/path/to/htmldir     → static mode (path must exist)
+
+    A leading https:// makes nginx speak TLS to the backend
+    (proxy_pass https://). Default port follows the scheme: 80 for
+    http, 443 for https. With no scheme, the upstream is plain http.
 
 nginx-gen --remove <host>
 nginx-gen --list
@@ -129,6 +134,7 @@ nginx-gen --list
 | Flag                | Default              | Notes |
 |---                  |---                   |---    |
 | `--ssl`             | `true`               | Adds 443 listener, HSTS, HTTP→HTTPS redirect. Cert auto-resolved. |
+| `--proxy-ssl-verify`| `false`              | Verify the backend cert (only for `https://` upstreams). Off = encrypt but don't authenticate; needed for IP/self-signed backends. |
 | `--allow`           | unset                | `cf` → Cloudflare IPs. Or comma-separated CIDRs/IPs. |
 | `--cert-dir`        | `/etc/letsencrypt/live` | Cert lookup base. Also `$NGINX_CERT_DIR`. |
 | `--brotli`          | `auto`               | `auto` = best-effort. `on` = require/build. `off` = skip entirely. |
@@ -346,6 +352,8 @@ sudo nginx-gen --abi-check                           # cron-friendly status
 # Per-vhost (proxy)
 sudo nginx-gen api.example.com 10.0.0.5:8080
 sudo nginx-gen --allow=cf --cert-dir=/etc/ssl/cf api.tumult.dev 127.0.0.1:8080
+sudo nginx-gen manager.skybyte.cloud https://5.231.234.5:8443             # TLS to backend (unverified)
+sudo nginx-gen --proxy-ssl-verify app.example.com https://backend.internal:8443  # + verify backend cert
 
 # Per-vhost (static)
 sudo nginx-gen blog.example.com /var/www/blog

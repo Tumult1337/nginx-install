@@ -71,6 +71,59 @@ func TestProxySSLWithCF(t *testing.T) {
 	mustNotContain(t, s, "limit_req")        // CF handles rate limiting at the edge
 	mustContain(t, s, "proxy_pass http://p_example_com_up;")
 	mustContain(t, s, "ssl_stapling off;")
+	// Plain http upstream must not emit any backend-TLS directives.
+	mustNotContain(t, s, "proxy_ssl_")
+}
+
+func TestProxyHTTPSUpstream(t *testing.T) {
+	cfg := VhostCfg{
+		Host:         "manager.skybyte.cloud",
+		Mode:         ModeProxy,
+		SSL:          true,
+		CertDir:      "/etc/letsencrypt/live/skybyte.cloud",
+		Allow:        AllowNone,
+		Upstream:     "5.231.234.5:8443",
+		UpstreamName: "manager_skybyte_cloud_up",
+		UpstreamSSL:  true,
+		Now:          fixedTime,
+	}
+	out, err := Vhost(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := string(out)
+	mustContain(t, s, "proxy_pass https://manager_skybyte_cloud_up;")
+	mustContain(t, s, "proxy_ssl_server_name on;")
+	// SNI/cert name is the public host, not the upstream block name.
+	mustContain(t, s, "proxy_ssl_name        manager.skybyte.cloud;")
+	mustContain(t, s, "proxy_ssl_verify off;")
+	mustNotContain(t, s, "proxy_ssl_verify              on;")
+	mustNotContain(t, s, "proxy_ssl_name        manager_skybyte_cloud_up;")
+}
+
+func TestProxyHTTPSUpstreamVerify(t *testing.T) {
+	cfg := VhostCfg{
+		Host:           "manager.skybyte.cloud",
+		Mode:           ModeProxy,
+		SSL:            true,
+		CertDir:        "/etc/letsencrypt/live/skybyte.cloud",
+		Allow:          AllowNone,
+		Upstream:       "backend.internal:8443",
+		UpstreamName:   "manager_skybyte_cloud_up",
+		UpstreamSSL:    true,
+		UpstreamVerify: true,
+		Now:            fixedTime,
+	}
+	out, err := Vhost(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := string(out)
+	mustContain(t, s, "proxy_pass https://manager_skybyte_cloud_up;")
+	mustContain(t, s, "proxy_ssl_verify              on;")
+	mustContain(t, s, "proxy_ssl_verify_depth        2;")
+	mustContain(t, s, "proxy_ssl_trusted_certificate /etc/ssl/certs/ca-certificates.crt;")
+	mustNotContain(t, s, "proxy_ssl_verify off;")
 }
 
 func TestStaplingNotDisabledWithoutCF(t *testing.T) {

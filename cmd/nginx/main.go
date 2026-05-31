@@ -32,15 +32,15 @@ import (
 )
 
 type Layout struct {
-	SitesAvailable   string
-	SitesEnabled     string
-	MainConfPath     string
-	BackupDir        string
-	LockPath         string
-	SnippetPath      string
-	CachePath        string
-	CertDir          string
-	SysctlPath       string
+	SitesAvailable     string
+	SitesEnabled       string
+	MainConfPath       string
+	BackupDir          string
+	LockPath           string
+	SnippetPath        string
+	CachePath          string
+	CertDir            string
+	SysctlPath         string
 	SystemdOverrideDir string
 	ModulesDir         string // where compiled .so files live (load_module path)
 	ModulesEnabledDir  string // where load_module *.conf snippets live
@@ -54,15 +54,15 @@ func DefaultLayout() Layout {
 		return def
 	}
 	return Layout{
-		SitesAvailable:    get("NGINX_SITES_AVAILABLE", "/etc/nginx/sites-available"),
-		SitesEnabled:      get("NGINX_SITES_ENABLED", "/etc/nginx/sites-enabled"),
-		MainConfPath:      get("NGINX_CONF_PATH", "/etc/nginx/nginx.conf"),
-		BackupDir:         get("NGINX_BACKUP_DIR", "/var/backups/nginx-gen"),
-		LockPath:          get("NGINX_LOCK_PATH", "/run/nginx-gen.lock"),
-		SnippetPath:       get("NGINX_CF_SNIPPET", cf.DefaultSnippet),
-		CachePath:         get("NGINX_CF_CACHE", cf.DefaultCache),
-		CertDir:           get("NGINX_CERT_DIR", "/etc/letsencrypt/live"),
-		SysctlPath:        get("NGINX_SYSCTL_PATH", "/etc/sysctl.d/99-nginx.conf"),
+		SitesAvailable:     get("NGINX_SITES_AVAILABLE", "/etc/nginx/sites-available"),
+		SitesEnabled:       get("NGINX_SITES_ENABLED", "/etc/nginx/sites-enabled"),
+		MainConfPath:       get("NGINX_CONF_PATH", "/etc/nginx/nginx.conf"),
+		BackupDir:          get("NGINX_BACKUP_DIR", "/var/backups/nginx-gen"),
+		LockPath:           get("NGINX_LOCK_PATH", "/run/nginx-gen.lock"),
+		SnippetPath:        get("NGINX_CF_SNIPPET", cf.DefaultSnippet),
+		CachePath:          get("NGINX_CF_CACHE", cf.DefaultCache),
+		CertDir:            get("NGINX_CERT_DIR", "/etc/letsencrypt/live"),
+		SysctlPath:         get("NGINX_SYSCTL_PATH", "/etc/sysctl.d/99-nginx.conf"),
 		SystemdOverrideDir: get("NGINX_SYSTEMD_OVERRIDE_DIR", "/etc/systemd/system/nginx.service.d"),
 		ModulesDir:         get("NGINX_MODULES_DIR", "/etc/nginx/modules"),
 		ModulesEnabledDir:  get("NGINX_MODULES_ENABLED_DIR", "/etc/nginx/modules-enabled"),
@@ -111,9 +111,9 @@ func Run(args []string, d Deps) int {
 	fs := flag.NewFlagSet("nginx-gen", flag.ContinueOnError)
 	fs.SetOutput(d.Stderr)
 
-	useMain  := fs.Bool("main", false, "write the global /etc/nginx/nginx.conf")
+	useMain := fs.Bool("main", false, "write the global /etc/nginx/nginx.conf")
 	doRemove := fs.Bool("remove", false, "remove a managed vhost: --remove <host>")
-	doList   := fs.Bool("list", false, "list managed vhosts")
+	doList := fs.Bool("list", false, "list managed vhosts")
 	doSysctl := fs.Bool("sysctl", false, "install sysctl tuning and systemd LimitNOFILE override")
 	doBrotliBuild := fs.Bool("brotli-build", false, "compile ngx_brotli dynamic modules against the installed nginx (for hosts where the Debian brotli packages are ABI-incompatible)")
 	doInstall := fs.Bool("install", false, "bootstrap a fresh nginx install: add nginx.org repo, apt-get install nginx, render managed nginx.conf, optionally build brotli")
@@ -123,14 +123,15 @@ func Run(args []string, d Deps) int {
 	doConvert := fs.Bool("convert", false, "best-effort migration of an existing (Debian/other) nginx install into nginx-gen's managed setup; snapshots /etc/nginx + writes a rollback script before touching anything")
 	doSelfUpdate := fs.Bool("self-update", false, "replace this nginx-gen binary with the latest GitHub release (verified by sha256). Does NOT touch nginx itself — use --nginx-upgrade for that.")
 	doVersion := fs.Bool("version", false, "print nginx-gen tool version and exit")
-	channel  := fs.String("channel", "mainline", "nginx.org channel: mainline | stable (only used with --install / --bootstrap)")
-	useSSL   := fs.Bool("ssl", true, "enable SSL listener (HTTP→HTTPS redirect + 443)")
+	channel := fs.String("channel", "mainline", "nginx.org channel: mainline | stable (only used with --install / --bootstrap)")
+	useSSL := fs.Bool("ssl", true, "enable SSL listener (HTTP→HTTPS redirect + 443)")
+	proxySSLVerify := fs.Bool("proxy-ssl-verify", false, "verify the backend's TLS cert (only applies to https:// upstreams; default off)")
 	allowFlag := fs.String("allow", "", "cf | comma-separated CIDRs (or bare IPs)")
-	dryRun   := fs.Bool("dry-run", false, "print rendered config to stdout, no FS changes")
+	dryRun := fs.Bool("dry-run", false, "print rendered config to stdout, no FS changes")
 	noReload := fs.Bool("no-reload", false, "skip nginx -t and systemctl reload")
-	force    := fs.Bool("force", false, "overwrite files lacking the managed marker")
-	certDir  := fs.String("cert-dir", "", "override cert lookup base (default: $NGINX_CERT_DIR or /etc/letsencrypt/live)")
-	brotli   := fs.String("brotli", "auto", "auto: try to install brotli, fall back if unavailable | on: require brotli (error if unavailable) | off: render without brotli, skip apt entirely")
+	force := fs.Bool("force", false, "overwrite files lacking the managed marker")
+	certDir := fs.String("cert-dir", "", "override cert lookup base (default: $NGINX_CERT_DIR or /etc/letsencrypt/live)")
+	brotli := fs.String("brotli", "auto", "auto: try to install brotli, fall back if unavailable | on: require brotli (error if unavailable) | off: render without brotli, skip apt entirely")
 
 	if err := fs.Parse(args); err != nil {
 		return exitUserError
@@ -238,7 +239,7 @@ func Run(args []string, d Deps) int {
 		printUsage(d.Stderr)
 		return exitUserError
 	}
-	return runVhost(d, pos[0], pos[1], *useSSL, *allowFlag, *force, *dryRun, *noReload)
+	return runVhost(d, pos[0], pos[1], *useSSL, *proxySSLVerify, *allowFlag, *force, *dryRun, *noReload)
 }
 
 func printUsage(w io.Writer) {
@@ -263,7 +264,7 @@ func printUsage(w io.Writer) {
 
 // ---- vhost ----
 
-func runVhost(d Deps, host, target string, ssl bool, allowSpec string, force, dryRun, noReload bool) int {
+func runVhost(d Deps, host, target string, ssl, proxySSLVerify bool, allowSpec string, force, dryRun, noReload bool) int {
 	if !cli.ValidHost(host) {
 		fmt.Fprintln(d.Stderr, "invalid host:", host)
 		return exitUserError
@@ -271,10 +272,13 @@ func runVhost(d Deps, host, target string, ssl bool, allowSpec string, force, dr
 
 	migrateLegacyAllowConf(d.Stderr)
 
-	tk, tval, err := cli.ParseTarget(target)
+	tk, tval, scheme, err := cli.ParseTarget(target)
 	if err != nil {
 		fmt.Fprintln(d.Stderr, "target:", err)
 		return exitUserError
+	}
+	if proxySSLVerify && scheme != "https" {
+		fmt.Fprintln(d.Stderr, "note: --proxy-ssl-verify ignored (upstream is not https://)")
 	}
 
 	allowKind, allowCIDRs, err := cli.ParseAllow(allowSpec)
@@ -307,6 +311,8 @@ func runVhost(d Deps, host, target string, ssl bool, allowSpec string, force, dr
 		cfg.Mode = render.ModeProxy
 		cfg.Upstream = tval
 		cfg.UpstreamName = cli.UpstreamName(host)
+		cfg.UpstreamSSL = scheme == "https"
+		cfg.UpstreamVerify = cfg.UpstreamSSL && proxySSLVerify
 	case cli.TargetStatic:
 		cfg.Mode = render.ModeStatic
 		abs, err := filepath.Abs(tval)
@@ -344,7 +350,7 @@ func runVhost(d Deps, host, target string, ssl bool, allowSpec string, force, dr
 	}
 
 	targetAvail := filepath.Join(d.Layout.SitesAvailable, host+".conf")
-	targetLink  := filepath.Join(d.Layout.SitesEnabled, host+".conf")
+	targetLink := filepath.Join(d.Layout.SitesEnabled, host+".conf")
 
 	release, err := fsop.Flock(d.Layout.LockPath)
 	if err != nil {
@@ -426,6 +432,7 @@ func runVhost(d Deps, host, target string, ssl bool, allowSpec string, force, dr
 
 	logEvent(d.Stderr, d.Now(), "vhost-write", host, map[string]any{
 		"mode": cfg.Mode.String(), "ssl": ssl, "allow": cfg.Allow.String(),
+		"upstream_scheme": cfg.UpstreamProto(), "upstream_verify": cfg.UpstreamVerify,
 		"backup": backupPath, "result": "ok",
 	})
 	return exitOK
@@ -520,7 +527,7 @@ func runRemove(d Deps, host string, force, noReload bool) int {
 	}
 	migrateLegacyAllowConf(d.Stderr)
 	targetAvail := filepath.Join(d.Layout.SitesAvailable, host+".conf")
-	targetLink  := filepath.Join(d.Layout.SitesEnabled, host+".conf")
+	targetLink := filepath.Join(d.Layout.SitesEnabled, host+".conf")
 
 	release, err := fsop.Flock(d.Layout.LockPath)
 	if err != nil {
@@ -665,7 +672,7 @@ LimitNPROC=65535
 }
 
 func runSysctl(d Deps, force, dryRun, noReload bool) int {
-	sysctl  := sysctlContent()
+	sysctl := sysctlContent()
 	override := systemdOverrideContent()
 	overridePath := filepath.Join(d.Layout.SystemdOverrideDir, "override.conf")
 
@@ -1110,11 +1117,11 @@ const convertBackupRoot = "/var/backups/nginx-gen/convert"
 // runConvert migrates an existing (Debian or other) nginx install into
 // nginx-gen's managed setup, in the safest way possible:
 //
-//   1. Snapshot /etc/nginx (cp -a) + nginx -T + dpkg state to a timestamped
-//      backup dir.
-//   2. Write an executable rollback.sh next to the snapshot.
-//   3. Run --install (which itself rewrites nginx.conf with --force, deletes
-//      the upstream stub, optionally builds brotli) then --sysctl.
+//  1. Snapshot /etc/nginx (cp -a) + nginx -T + dpkg state to a timestamped
+//     backup dir.
+//  2. Write an executable rollback.sh next to the snapshot.
+//  3. Run --install (which itself rewrites nginx.conf with --force, deletes
+//     the upstream stub, optionally builds brotli) then --sysctl.
 //
 // Vhost files in sites-enabled/ are NOT rewritten — the caller can re-render
 // them with `nginx-gen <host> <target>` afterwards to put the managed

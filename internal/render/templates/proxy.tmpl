@@ -59,6 +59,20 @@ server {
 {{- end }}
 
     location / {
-        proxy_pass http://{{ .UpstreamName }};
+        proxy_pass {{ .UpstreamProto }}://{{ .UpstreamName }};
+{{- if .UpstreamSSL }}
+
+        # TLS to the backend. SNI + cert name use the public host, since the
+        # upstream is often addressed by IP while the backend serves this cert.
+        proxy_ssl_server_name on;
+        proxy_ssl_name        {{ .Host }};
+{{- if .UpstreamVerify }}
+        proxy_ssl_verify              on;
+        proxy_ssl_verify_depth        2;
+        proxy_ssl_trusted_certificate /etc/ssl/certs/ca-certificates.crt;
+{{- else }}
+        proxy_ssl_verify off;
+{{- end }}
+{{- end }}
     }
 }

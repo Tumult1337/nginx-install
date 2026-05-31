@@ -37,22 +37,34 @@ func TestValidHost(t *testing.T) {
 
 func TestParseUpstream(t *testing.T) {
 	cases := []struct {
-		in, want string
-		err      bool
+		in, wantScheme, wantHost string
+		err                      bool
 	}{
-		{"1.2.3.4", "1.2.3.4:80", false},
-		{"1.2.3.4:8080", "1.2.3.4:8080", false},
-		{"::1", "[::1]:80", false},
-		{"[::1]:8080", "[::1]:8080", false},
-		{"host.example.com", "host.example.com:80", false},
-		{"host.example.com:8080", "host.example.com:8080", false},
-		{"", "", true},
+		{in: "1.2.3.4", wantScheme: "http", wantHost: "1.2.3.4:80"},
+		{in: "1.2.3.4:8080", wantScheme: "http", wantHost: "1.2.3.4:8080"},
+		{in: "::1", wantScheme: "http", wantHost: "[::1]:80"},
+		{in: "[::1]:8080", wantScheme: "http", wantHost: "[::1]:8080"},
+		{in: "host.example.com", wantScheme: "http", wantHost: "host.example.com:80"},
+		{in: "host.example.com:8080", wantScheme: "http", wantHost: "host.example.com:8080"},
+		// explicit schemes
+		{in: "http://1.2.3.4", wantScheme: "http", wantHost: "1.2.3.4:80"},
+		{in: "http://1.2.3.4:8080", wantScheme: "http", wantHost: "1.2.3.4:8080"},
+		{in: "https://1.2.3.4:8443", wantScheme: "https", wantHost: "1.2.3.4:8443"},
+		{in: "https://1.2.3.4", wantScheme: "https", wantHost: "1.2.3.4:443"}, // scheme drives default port
+		{in: "https://host.example.com", wantScheme: "https", wantHost: "host.example.com:443"},
+		{in: "https://[::1]:8443", wantScheme: "https", wantHost: "[::1]:8443"},
+		{in: "https://::1", wantScheme: "https", wantHost: "[::1]:443"},
+		// rejections
+		{in: "", err: true},
+		{in: "https://", err: true},
+		{in: "https://host:8443/path", err: true}, // URL path not allowed in upstream
+		{in: "http://a?b", err: true},
 	}
 	for _, c := range cases {
-		got, err := ParseUpstream(c.in)
+		scheme, host, err := ParseUpstream(c.in)
 		if c.err {
 			if err == nil {
-				t.Errorf("ParseUpstream(%q) expected error, got %q", c.in, got)
+				t.Errorf("ParseUpstream(%q) expected error, got scheme=%q host=%q", c.in, scheme, host)
 			}
 			continue
 		}
@@ -60,8 +72,8 @@ func TestParseUpstream(t *testing.T) {
 			t.Errorf("ParseUpstream(%q) error: %v", c.in, err)
 			continue
 		}
-		if got != c.want {
-			t.Errorf("ParseUpstream(%q) = %q, want %q", c.in, got, c.want)
+		if scheme != c.wantScheme || host != c.wantHost {
+			t.Errorf("ParseUpstream(%q) = (%q, %q), want (%q, %q)", c.in, scheme, host, c.wantScheme, c.wantHost)
 		}
 	}
 }
@@ -77,30 +89,40 @@ func TestUpstreamName(t *testing.T) {
 
 func TestParseTargetStatic(t *testing.T) {
 	dir := t.TempDir()
-	kind, val, err := ParseTarget(dir)
+	kind, val, scheme, err := ParseTarget(dir)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if kind != TargetStatic || val != dir {
-		t.Errorf("kind=%v val=%q", kind, val)
+	if kind != TargetStatic || val != dir || scheme != "" {
+		t.Errorf("kind=%v val=%q scheme=%q", kind, val, scheme)
 	}
 }
 
 func TestParseTargetStaticMissing(t *testing.T) {
 	missing := filepath.Join(t.TempDir(), "nope")
-	_, _, err := ParseTarget(missing)
+	_, _, _, err := ParseTarget(missing)
 	if err == nil {
 		t.Fatal("expected error for missing static path")
 	}
 }
 
 func TestParseTargetProxy(t *testing.T) {
-	kind, val, err := ParseTarget("10.0.0.1:8080")
+	kind, val, scheme, err := ParseTarget("10.0.0.1:8080")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if kind != TargetProxy || val != "10.0.0.1:8080" {
-		t.Errorf("kind=%v val=%q", kind, val)
+	if kind != TargetProxy || val != "10.0.0.1:8080" || scheme != "http" {
+		t.Errorf("kind=%v val=%q scheme=%q", kind, val, scheme)
+	}
+}
+
+func TestParseTargetProxyHTTPS(t *testing.T) {
+	kind, val, scheme, err := ParseTarget("https://5.231.234.5:8443")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if kind != TargetProxy || val != "5.231.234.5:8443" || scheme != "https" {
+		t.Errorf("kind=%v val=%q scheme=%q", kind, val, scheme)
 	}
 }
 
