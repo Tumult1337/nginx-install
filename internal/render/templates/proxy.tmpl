@@ -60,6 +60,19 @@ server {
 
     location / {
         proxy_pass {{ .UpstreamProto }}://{{ .UpstreamName }};
+
+        # Restates the http-block proxy_set_header defaults: setting any
+        # proxy_set_header here drops inheritance of ALL of them, not just
+        # Upgrade/Connection. Upgrade/Connection ride $connection_upgrade
+        # (defined once in main.tmpl) to pass WebSocket upgrades through
+        # while leaving plain requests on the keepalive pool.
+        proxy_set_header Host              $host;
+        proxy_set_header X-Real-IP         $remote_addr;
+        proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_set_header X-Forwarded-Host  $host;
+        proxy_set_header Upgrade           $http_upgrade;
+        proxy_set_header Connection        $connection_upgrade;
 {{- if .UpstreamSSL }}
 
         # TLS to the backend. SNI + cert name use the public host, since the

@@ -75,6 +75,34 @@ func TestProxySSLWithCF(t *testing.T) {
 	mustNotContain(t, s, "proxy_ssl_")
 }
 
+func TestProxyLocationHeaders(t *testing.T) {
+	cfg := VhostCfg{
+		Host:         "p.example.com",
+		Mode:         ModeProxy,
+		SSL:          true,
+		CertDir:      "/etc/letsencrypt/live/example.com",
+		Allow:        AllowNone,
+		Upstream:     "10.0.0.1:8080",
+		UpstreamName: "p_example_com_up",
+		Now:          fixedTime,
+	}
+	out, err := Vhost(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := string(out)
+	// Setting any proxy_set_header in the location block drops inherited
+	// http-block defaults wholesale, so these must all be restated here —
+	// this is the actual redirect-to-upstream-name bug class.
+	mustContain(t, s, "proxy_set_header Host              $host;")
+	mustContain(t, s, "proxy_set_header X-Real-IP         $remote_addr;")
+	mustContain(t, s, "proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;")
+	mustContain(t, s, "proxy_set_header X-Forwarded-Proto $scheme;")
+	mustContain(t, s, "proxy_set_header X-Forwarded-Host  $host;")
+	mustContain(t, s, "proxy_set_header Upgrade           $http_upgrade;")
+	mustContain(t, s, "proxy_set_header Connection        $connection_upgrade;")
+}
+
 func TestProxyHTTPSUpstream(t *testing.T) {
 	cfg := VhostCfg{
 		Host:         "manager.skybyte.cloud",
@@ -236,6 +264,8 @@ func TestMain(t *testing.T) {
 	mustNotContain(t, s, "reqip_cf")
 	mustNotContain(t, s, "$cf_rl_key")
 	mustContain(t, s, "ssl_protocols             TLSv1.2 TLSv1.3;")
+	mustContain(t, s, "map $http_upgrade $connection_upgrade {")
+	mustContain(t, s, "proxy_set_header       Connection        \"\";")
 	mustContain(t, s, "include /etc/nginx/conf.d/*.conf;")
 	mustContain(t, s, "include /etc/nginx/sites-enabled/*.conf;")
 	// conf.d include must precede sites-enabled so http-scope snippets
