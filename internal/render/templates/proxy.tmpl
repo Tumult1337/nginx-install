@@ -27,7 +27,9 @@ server {
 
     ssl_certificate     {{ .CertDir }}/fullchain.pem;
     ssl_certificate_key {{ .CertDir }}/privkey.pem;
-    add_header Strict-Transport-Security "max-age=63072000; includeSubDomains" always;
+{{- with .HSTSHeader }}
+    add_header Strict-Transport-Security "{{ . }}" always;
+{{- end }}
 {{- if .IsCF }}
 
     # Cloudflare Origin CA has no OCSP responder; disable stapling to avoid

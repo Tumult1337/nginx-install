@@ -134,6 +134,38 @@ func ParseTarget(arg string) (kind TargetKind, value, scheme string, err error) 
 	return TargetProxy, up, scheme, nil
 }
 
+// HSTSKind discriminates --hsts values, ordered by blast radius.
+type HSTSKind int
+
+const (
+	HSTSOff HSTSKind = iota
+	HSTSOn
+	HSTSSubdomains
+	HSTSPreload
+)
+
+// ParseHSTS handles "" / "off" (no header), "on" (this host only),
+// "subdomains" (+ includeSubDomains), and "preload" (+ preload). Case
+// -insensitive, matching ParseAllow's handling of "cf".
+//
+// Anything above "on" is deliberately opt-in: includeSubDomains and preload
+// are enforced by browsers against a cache the operator cannot reach, so
+// asserting them for a host whose siblings may not serve TLS breaks those
+// siblings for as long as the max-age lasts.
+func ParseHSTS(s string) (HSTSKind, error) {
+	switch strings.ToLower(strings.TrimSpace(s)) {
+	case "", "off":
+		return HSTSOff, nil
+	case "on":
+		return HSTSOn, nil
+	case "subdomains":
+		return HSTSSubdomains, nil
+	case "preload":
+		return HSTSPreload, nil
+	}
+	return HSTSOff, fmt.Errorf("invalid --hsts value %q: want off | on | subdomains | preload", s)
+}
+
 // AllowKind discriminates --allow values.
 type AllowKind int
 

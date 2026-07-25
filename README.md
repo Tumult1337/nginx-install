@@ -116,6 +116,7 @@ nginx-gen --main          [--brotli=auto|on|off] [--force] [--dry-run] [--no-rel
 
 # ---- per-vhost ----
 nginx-gen [--ssl] [--proxy-ssl-verify] [--allow=cf|cidrs] [--cert-dir=...]
+          [--hsts=off|on|subdomains|preload]
           [--force] [--dry-run] [--no-reload] <host> <target>
     target = [http://|https://]ip[:port]   → proxy mode
            = [http://|https://]host[:port] → proxy mode
@@ -133,9 +134,10 @@ nginx-gen --list
 
 | Flag                | Default              | Notes |
 |---                  |---                   |---    |
-| `--ssl`             | `true`               | Adds 443 listener, HSTS, HTTP→HTTPS redirect. Cert auto-resolved. |
+| `--ssl`             | `true`               | Adds 443 listener, HTTP→HTTPS redirect. Cert auto-resolved. |
 | `--proxy-ssl-verify`| `false`              | Verify the backend cert (only for `https://` upstreams). Off = encrypt but don't authenticate; needed for IP/self-signed backends. |
 | `--allow`           | unset                | `cf` → Cloudflare IPs. Or comma-separated CIDRs/IPs. |
+| `--hsts`            | `off`                | `on` → this host only. `subdomains`, `preload` → see [HSTS](#--hsts) before using. Requires `--ssl`. |
 | `--cert-dir`        | `/etc/letsencrypt/live` | Cert lookup base. Also `$NGINX_CERT_DIR`. |
 | `--brotli`          | `auto`               | `auto` = best-effort. `on` = require/build. `off` = skip entirely. |
 | `--channel`         | `mainline`           | nginx.org repo channel (only for `--install` / `--bootstrap`). |
@@ -220,6 +222,54 @@ then `example.com`. First directory containing `fullchain.pem` wins.
 
 Default base is `/etc/letsencrypt/live` (override via `--cert-dir` or
 `$NGINX_CERT_DIR`). For Cloudflare Origin certs: `--cert-dir=/etc/ssl/cf`.
+
+## `--hsts`
+
+Off by default. HSTS is the one header here whose blast radius outlives the
+config that produced it: browsers cache the directive for its full `max-age`
+and enforce it against a store you cannot reach. Deleting the vhost, reverting
+the commit, or reinstalling the server does not retract it.
+
+| Value        | Emitted header                                            |
+|---           |---                                                        |
+| `off`        | *(nothing)*                                               |
+| `on`         | `max-age=63072000`                                        |
+| `subdomains` | `max-age=63072000; includeSubDomains`                     |
+| `preload`    | `max-age=63072000; includeSubDomains; preload`            |
+
+`max-age` is fixed at two years, which satisfies the preload list's one-year
+minimum. There is no flag to tune it.
+
+**`subdomains` asserts policy over hosts this vhost knows nothing about.**
+Setting it on `app.example.com` tells browsers that *every* name under
+`example.com` must be HTTPS — including siblings that serve plain HTTP, an
+internal tool on port 80, or a subdomain that does not exist yet. Those break
+for anyone who visited `app.example.com` first, and stay broken for up to two
+years. Use it only when you control every current and future subdomain and all
+of them serve TLS.
+
+**`preload` is effectively permanent.** The token alone does nothing; you must
+submit the domain at <https://hstspreload.org> separately. Once accepted, the
+rule ships hardcoded inside browser binaries, so removal requires a delisting
+request plus a full browser release cycle — months, and older installs never
+update. Do not use it on a domain you might repurpose.
+
+### Behind Cloudflare
+
+Cloudflare terminates TLS at the edge, so the browser sees CF's response, not
+the origin's — but CF passes the origin's HSTS header through by default, so
+`--hsts` here still reaches real browsers. Pick one owner for the header:
+either set it at CF (SSL/TLS → Edge Certificates → HSTS) and leave `--hsts=off`
+here, or manage it here and leave CF's setting disabled. Two sources means the
+one you forget about is the one that bites.
+
+### Undoing a mistake
+
+`--hsts=off` stops *sending* the header; it does not retract what browsers
+already cached. Genuinely unwinding a bad policy means serving `max-age=0` over
+HTTPS from the affected host until clients revisit, which this tool does not
+generate — hand-edit the vhost for that. Prevention is much cheaper than the
+cure, which is why `subdomains` and `preload` are opt-in.
 
 ## `--allow=cf`
 
@@ -362,6 +412,10 @@ sudo nginx-gen --ssl=false health.example.com 127.0.0.1:9090
 # Custom CIDRs
 sudo nginx-gen --allow=10.0.0.0/8,192.168.1.0/24 internal.example.com 10.0.0.7
 
+# HSTS (off by default — read the --hsts section before using subdomains/preload)
+sudo nginx-gen --hsts=on app.example.com 10.0.0.5:8080          # this host only
+sudo nginx-gen --hsts=subdomains example.com /var/www/site      # all subdomains must be TLS
+
 # Management
 sudo nginx-gen --list
 sudo nginx-gen --remove old.example.com
@@ -402,7 +456,7 @@ Every file the tool writes starts with:
 
 ```
 # Managed by nginx-gen. Do not edit by hand.
-# kind=vhost host=... mode=... ssl=... allow=... ts=...
+# kind=vhost host=... mode=... ssl=... allow=... hsts=... ts=...
 ```
 
 Files without the marker are treated as user-managed; the tool refuses to

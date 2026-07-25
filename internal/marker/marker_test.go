@@ -10,7 +10,7 @@ import (
 
 func TestRenderParseRoundtripVhost(t *testing.T) {
 	now := time.Date(2026, 5, 3, 12, 0, 0, 0, time.UTC)
-	rendered := RenderVhost("example.com", "proxy", true, "cf", now)
+	rendered := RenderVhost(Header{Host: "example.com", Mode: "proxy", SSL: true, Allow: "cf", HSTS: "subdomains", TS: now})
 
 	h, ok := Parse([]byte(rendered + "server { ... }\n"))
 	if !ok {
@@ -78,7 +78,7 @@ func TestRequireOurs(t *testing.T) {
 
 	// ours
 	ours := filepath.Join(dir, "ours.conf")
-	if err := os.WriteFile(ours, []byte(RenderVhost("a.com", "static", false, "none", now)+"server{}"), 0644); err != nil {
+	if err := os.WriteFile(ours, []byte(RenderVhost(Header{Host: "a.com", Mode: "static", SSL: false, Allow: "none", HSTS: "off", TS: now})+"server{}"), 0644); err != nil {
 		t.Fatal(err)
 	}
 	r, h, err := RequireOurs(ours)
@@ -97,5 +97,39 @@ func TestRequireOurs(t *testing.T) {
 	r, _, err = RequireOurs(notOurs)
 	if err != nil || r != CheckNotOurs {
 		t.Fatalf("notours: r=%v err=%v", r, err)
+	}
+}
+
+func TestParseHSTSField(t *testing.T) {
+	now := time.Date(2026, 5, 3, 12, 0, 0, 0, time.UTC)
+	for _, want := range []string{"off", "on", "subdomains", "preload"} {
+		rendered := RenderVhost(Header{
+			Host: "example.com", Mode: "proxy", SSL: true, Allow: "none", HSTS: want, TS: now,
+		})
+		h, ok := Parse([]byte(rendered))
+		if !ok {
+			t.Fatalf("hsts=%s: Parse returned ok=false", want)
+		}
+		if h.HSTS != want {
+			t.Errorf("HSTS = %q, want %q", h.HSTS, want)
+		}
+	}
+}
+
+// Markers written before --hsts existed have no hsts= field. They must still
+// parse cleanly, with HSTS left empty so callers can tell "unknown" apart from
+// an explicit "off" — the two imply different prior behavior on the wire.
+func TestParsePreHSTSMarker(t *testing.T) {
+	legacy := FirstLine + "\n" +
+		"# kind=vhost host=example.com mode=proxy ssl=true allow=cf ts=2026-05-03T12:00:00Z\n"
+	h, ok := Parse([]byte(legacy))
+	if !ok {
+		t.Fatal("Parse returned ok=false for pre-hsts marker")
+	}
+	if h.HSTS != "" {
+		t.Errorf("HSTS = %q, want empty for a marker with no hsts= field", h.HSTS)
+	}
+	if h.Host != "example.com" || h.Allow != "cf" || !h.SSL {
+		t.Errorf("other fields corrupted: %+v", h)
 	}
 }

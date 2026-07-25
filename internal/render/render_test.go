@@ -50,6 +50,7 @@ func TestProxySSLWithCF(t *testing.T) {
 		SSL:          true,
 		CertDir:      "/etc/letsencrypt/live/example.com",
 		Allow:        AllowCF,
+		HSTS:         HSTSOn,
 		Upstream:     "10.0.0.1:8080",
 		UpstreamName: "p_example_com_up",
 		Now:          fixedTime,
@@ -316,4 +317,114 @@ func firstLines(b []byte, n int) string {
 		parts = parts[:n]
 	}
 	return strings.Join(parts, "\n")
+}
+
+func TestHSTSHeader(t *testing.T) {
+	const maxAge = "max-age=63072000"
+	cases := []struct {
+		name string
+		ssl  bool
+		h    HSTS
+		want string
+	}{
+		{"off", true, HSTSOff, ""},
+		{"on", true, HSTSOn, maxAge},
+		{"subdomains", true, HSTSSubdomains, maxAge + "; includeSubDomains"},
+		{"preload", true, HSTSPreload, maxAge + "; includeSubDomains; preload"},
+		// No SSL: RFC 6797 §8.1 has clients ignore HSTS over plain HTTP, so
+		// emitting it would only make a config look hardened without being so.
+		{"no-ssl off", false, HSTSOff, ""},
+		{"no-ssl on", false, HSTSOn, ""},
+		{"no-ssl preload", false, HSTSPreload, ""},
+	}
+	for _, c := range cases {
+		got := VhostCfg{SSL: c.ssl, HSTS: c.h}.HSTSHeader()
+		if got != c.want {
+			t.Errorf("%s: HSTSHeader() = %q, want %q", c.name, got, c.want)
+		}
+	}
+}
+
+func TestHSTSOffEmitsNoHeader(t *testing.T) {
+	for _, mode := range []Mode{ModeProxy, ModeStatic} {
+		cfg := VhostCfg{
+			Host: "h.example.com", Mode: mode, SSL: true, HSTS: HSTSOff,
+			CertDir:  "/etc/letsencrypt/live/example.com",
+			Upstream: "10.0.0.1:8080", UpstreamName: "h_up",
+			Root: "/var/www/h", Now: fixedTime,
+		}
+		out, err := Vhost(cfg)
+		if err != nil {
+			t.Fatal(err)
+		}
+		mustNotContain(t, string(out), "Strict-Transport-Security")
+	}
+}
+
+// nginx inherits add_header from the parent level only when the current level
+// declares none. The static asset location sets Cache-Control, so without an
+// explicit restatement every css/js/font/image response would silently ship
+// without HSTS while the server block still advertised it.
+func TestStaticAssetLocationRestatesHSTS(t *testing.T) {
+	cfg := VhostCfg{
+		Host: "s.example.com", Mode: ModeStatic, SSL: true, HSTS: HSTSSubdomains,
+		CertDir: "/etc/letsencrypt/live/example.com",
+		Root:    "/var/www/s", Now: fixedTime,
+	}
+	out, err := Vhost(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := string(out)
+	if n := strings.Count(s, "Strict-Transport-Security"); n != 2 {
+		t.Errorf("want HSTS twice (server + asset location), got %d\n%s", n, s)
+	}
+
+	_, loc, ok := strings.Cut(s, "location ~*")
+	if !ok {
+		t.Fatal("asset location block not found")
+	}
+	if !strings.Contains(loc, "Strict-Transport-Security") {
+		t.Errorf("asset location has add_header Cache-Control but no HSTS restatement:\n%s", loc)
+	}
+	if !strings.Contains(loc, "Cache-Control") {
+		t.Errorf("asset location lost Cache-Control:\n%s", loc)
+	}
+}
+
+// With HSTS off there is nothing to restate, so the asset location must not
+// gain a stray header.
+func TestStaticAssetLocationNoHSTSWhenOff(t *testing.T) {
+	cfg := VhostCfg{
+		Host: "s.example.com", Mode: ModeStatic, SSL: true, HSTS: HSTSOff,
+		CertDir: "/etc/letsencrypt/live/example.com",
+		Root:    "/var/www/s", Now: fixedTime,
+	}
+	out, err := Vhost(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mustNotContain(t, string(out), "Strict-Transport-Security")
+	mustContain(t, string(out), `add_header Cache-Control "public, immutable";`)
+}
+
+func TestHSTSRecordedInMarker(t *testing.T) {
+	for _, c := range []struct {
+		h    HSTS
+		want string
+	}{
+		{HSTSOff, "hsts=off"},
+		{HSTSOn, "hsts=on"},
+		{HSTSSubdomains, "hsts=subdomains"},
+		{HSTSPreload, "hsts=preload"},
+	} {
+		out, err := Vhost(VhostCfg{
+			Host: "m.example.com", Mode: ModeStatic, SSL: true, HSTS: c.h,
+			CertDir: "/etc/letsencrypt/live/example.com", Root: "/var/www/m", Now: fixedTime,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		mustContain(t, firstLines(out, 2), c.want)
+	}
 }

@@ -157,3 +157,43 @@ func TestParseAllow(t *testing.T) {
 		t.Error("expected error on invalid CIDR")
 	}
 }
+
+func TestParseHSTS(t *testing.T) {
+	cases := []struct {
+		in      string
+		want    HSTSKind
+		wantErr bool
+	}{
+		{"", HSTSOff, false},
+		{"off", HSTSOff, false},
+		{"on", HSTSOn, false},
+		{"subdomains", HSTSSubdomains, false},
+		{"preload", HSTSPreload, false},
+		{"  On  ", HSTSOn, false},
+		{"SUBDOMAINS", HSTSSubdomains, false},
+		// Unhappy paths: an unrecognized value must fail loudly rather than
+		// degrade to off, which would silently drop a header the operator asked for.
+		{"true", HSTSOff, true},
+		{"yes", HSTSOff, true},
+		{"1", HSTSOff, true},
+		{"max-age=31536000", HSTSOff, true},
+		{"on,subdomains", HSTSOff, true},
+	}
+	for _, c := range cases {
+		got, err := ParseHSTS(c.in)
+		if (err != nil) != c.wantErr {
+			t.Errorf("ParseHSTS(%q): err=%v wantErr=%v", c.in, err, c.wantErr)
+			continue
+		}
+		if got != c.want {
+			t.Errorf("ParseHSTS(%q) = %v, want %v", c.in, got, c.want)
+		}
+	}
+}
+
+func TestHSTSKindOrdering(t *testing.T) {
+	// warnHSTSDowngrade compares these with <, so the order is load-bearing.
+	if HSTSOff >= HSTSOn || HSTSOn >= HSTSSubdomains || HSTSSubdomains >= HSTSPreload {
+		t.Error("HSTSKind constants are not ordered by blast radius")
+	}
+}

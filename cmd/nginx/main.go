@@ -127,6 +127,7 @@ func Run(args []string, d Deps) int {
 	useSSL := fs.Bool("ssl", true, "enable SSL listener (HTTP→HTTPS redirect + 443)")
 	proxySSLVerify := fs.Bool("proxy-ssl-verify", false, "verify the backend's TLS cert (only applies to https:// upstreams; default off)")
 	allowFlag := fs.String("allow", "", "cf | comma-separated CIDRs (or bare IPs)")
+	hstsFlag := fs.String("hsts", "off", "off | on | subdomains | preload — Strict-Transport-Security policy (requires --ssl). subdomains and preload bind every subdomain in browser caches for up to 2y and are hard to undo.")
 	dryRun := fs.Bool("dry-run", false, "print rendered config to stdout, no FS changes")
 	noReload := fs.Bool("no-reload", false, "skip nginx -t and systemctl reload")
 	force := fs.Bool("force", false, "overwrite files lacking the managed marker")
@@ -239,12 +240,23 @@ func Run(args []string, d Deps) int {
 		printUsage(d.Stderr)
 		return exitUserError
 	}
-	return runVhost(d, pos[0], pos[1], *useSSL, *proxySSLVerify, *allowFlag, *force, *dryRun, *noReload)
+	return runVhost(d, vhostOpts{
+		Host:           pos[0],
+		Target:         pos[1],
+		SSL:            *useSSL,
+		ProxySSLVerify: *proxySSLVerify,
+		AllowSpec:      *allowFlag,
+		HSTSSpec:       *hstsFlag,
+		Force:          *force,
+		DryRun:         *dryRun,
+		NoReload:       *noReload,
+	})
 }
 
 func printUsage(w io.Writer) {
 	fmt.Fprintln(w, "Usage:")
-	fmt.Fprintln(w, "  nginx-gen [--ssl=true|false] [--allow=cf|cidrs] [--cert-dir=DIR] [--force] [--dry-run] [--no-reload] <host> <target>")
+	fmt.Fprintln(w, "  nginx-gen [--ssl=true|false] [--allow=cf|cidrs] [--hsts=off|on|subdomains|preload] [--cert-dir=DIR] [--force] [--dry-run] [--no-reload] <host> <target>")
+	fmt.Fprintln(w, "    hsts     = off (default) | on (this host) | subdomains | preload")
 	fmt.Fprintln(w, "    target   = ip[:port] | host[:port]   (proxy mode)")
 	fmt.Fprintln(w, "             = /absolute/path/to/htmldir (static mode, must exist)")
 	fmt.Fprintln(w, "    cert-dir = lookup base for <host>/fullchain.pem (default: $NGINX_CERT_DIR or /etc/letsencrypt/live)")
@@ -264,7 +276,24 @@ func printUsage(w io.Writer) {
 
 // ---- vhost ----
 
-func runVhost(d Deps, host, target string, ssl, proxySSLVerify bool, allowSpec string, force, dryRun, noReload bool) int {
+// vhostOpts carries the flag-derived inputs for a vhost write. It exists
+// because the positional form had grown to three same-typed bools plus two
+// same-typed strings, where a transposed pair at the call site would compile
+// cleanly and silently write the wrong config.
+type vhostOpts struct {
+	Host           string
+	Target         string
+	AllowSpec      string
+	HSTSSpec       string
+	SSL            bool
+	ProxySSLVerify bool
+	Force          bool
+	DryRun         bool
+	NoReload       bool
+}
+
+func runVhost(d Deps, o vhostOpts) int {
+	host := o.Host
 	if !cli.ValidHost(host) {
 		fmt.Fprintln(d.Stderr, "invalid host:", host)
 		return exitUserError
@@ -272,26 +301,43 @@ func runVhost(d Deps, host, target string, ssl, proxySSLVerify bool, allowSpec s
 
 	migrateLegacyAllowConf(d.Stderr)
 
-	tk, tval, scheme, err := cli.ParseTarget(target)
+	tk, tval, scheme, err := cli.ParseTarget(o.Target)
 	if err != nil {
 		fmt.Fprintln(d.Stderr, "target:", err)
 		return exitUserError
 	}
-	if proxySSLVerify && scheme != "https" {
+	if o.ProxySSLVerify && scheme != "https" {
 		fmt.Fprintln(d.Stderr, "note: --proxy-ssl-verify ignored (upstream is not https://)")
 	}
 
-	allowKind, allowCIDRs, err := cli.ParseAllow(allowSpec)
+	allowKind, allowCIDRs, err := cli.ParseAllow(o.AllowSpec)
 	if err != nil {
 		fmt.Fprintln(d.Stderr, "allow:", err)
 		return exitUserError
+	}
+
+	hstsKind, err := cli.ParseHSTS(o.HSTSSpec)
+	if err != nil {
+		fmt.Fprintln(d.Stderr, "hsts:", err)
+		return exitUserError
+	}
+	// Reject rather than silently drop: browsers ignore HSTS received over
+	// plain HTTP (RFC 6797 §8.1), so honoring this combination would hand the
+	// operator a config that looks hardened and is not.
+	if hstsKind != cli.HSTSOff && !o.SSL {
+		fmt.Fprintln(d.Stderr, "hsts: --hsts requires --ssl (browsers ignore HSTS sent over plain HTTP)")
+		return exitUserError
+	}
+	if hstsKind == cli.HSTSPreload {
+		fmt.Fprintln(d.Stderr, "note: --hsts=preload only emits the token; submit the domain at",
+			"https://hstspreload.org separately. Delisting takes months — see README.")
 	}
 
 	// Detect nginx version for http2 directive syntax. Skip in dry-run (nginx
 	// may not be installed in the calling environment). On detection failure,
 	// vi stays zero-value: HTTP2Inline() = false → modern `http2 on;` syntax.
 	var vi nginx.VersionInfo
-	if !dryRun {
+	if !o.DryRun {
 		if d.NginxVersion != nil {
 			vi, _ = d.NginxVersion()
 		} else {
@@ -301,7 +347,7 @@ func runVhost(d Deps, host, target string, ssl, proxySSLVerify bool, allowSpec s
 
 	cfg := render.VhostCfg{
 		Host:        host,
-		SSL:         ssl,
+		SSL:         o.SSL,
 		AllowCIDRs:  allowCIDRs,
 		Now:         d.Now(),
 		HTTP2Inline: vi.HTTP2Inline(),
@@ -312,7 +358,7 @@ func runVhost(d Deps, host, target string, ssl, proxySSLVerify bool, allowSpec s
 		cfg.Upstream = tval
 		cfg.UpstreamName = cli.UpstreamName(host)
 		cfg.UpstreamSSL = scheme == "https"
-		cfg.UpstreamVerify = cfg.UpstreamSSL && proxySSLVerify
+		cfg.UpstreamVerify = cfg.UpstreamSSL && o.ProxySSLVerify
 	case cli.TargetStatic:
 		cfg.Mode = render.ModeStatic
 		abs, err := filepath.Abs(tval)
@@ -328,8 +374,16 @@ func runVhost(d Deps, host, target string, ssl, proxySSLVerify bool, allowSpec s
 	case cli.AllowList:
 		cfg.Allow = render.AllowList
 	}
+	switch hstsKind {
+	case cli.HSTSOn:
+		cfg.HSTS = render.HSTSOn
+	case cli.HSTSSubdomains:
+		cfg.HSTS = render.HSTSSubdomains
+	case cli.HSTSPreload:
+		cfg.HSTS = render.HSTSPreload
+	}
 
-	if ssl {
+	if o.SSL {
 		certDir, err := cert.Resolve(host, d.Layout.CertDir)
 		if err != nil {
 			fmt.Fprintln(d.Stderr, "cert:", err)
@@ -344,7 +398,7 @@ func runVhost(d Deps, host, target string, ssl, proxySSLVerify bool, allowSpec s
 		return exitSystemErr
 	}
 
-	if dryRun {
+	if o.DryRun {
 		_, _ = d.Stdout.Write(rendered)
 		return exitOK
 	}
@@ -377,14 +431,17 @@ func runVhost(d Deps, host, target string, ssl, proxySSLVerify bool, allowSpec s
 	}
 
 	// Marker check on sites-available
-	chk, _, err := marker.RequireOurs(targetAvail)
+	chk, prev, err := marker.RequireOurs(targetAvail)
 	if err != nil {
 		fmt.Fprintln(d.Stderr, "marker check:", err)
 		return exitSystemErr
 	}
-	if chk == marker.CheckNotOurs && !force {
+	if chk == marker.CheckNotOurs && !o.Force {
 		fmt.Fprintln(d.Stderr, "refusing to overwrite unmanaged file:", targetAvail, "(use --force)")
 		return exitUserError
+	}
+	if chk == marker.CheckOurs {
+		warnHSTSDowngrade(d.Stderr, host, prev, cfg.HSTS)
 	}
 
 	backupPath, err := fsop.Backup(targetAvail, d.Layout.BackupDir)
@@ -414,7 +471,7 @@ func runVhost(d Deps, host, target string, ssl, proxySSLVerify bool, allowSpec s
 		return exitSystemErr
 	}
 
-	if !noReload {
+	if !o.NoReload {
 		if err := nginx.Test(d.Exec); err != nil {
 			fmt.Fprintln(d.Stderr, err)
 			rollback(d, targetAvail, backupPath)
@@ -431,11 +488,47 @@ func runVhost(d Deps, host, target string, ssl, proxySSLVerify bool, allowSpec s
 	}
 
 	logEvent(d.Stderr, d.Now(), "vhost-write", host, map[string]any{
-		"mode": cfg.Mode.String(), "ssl": ssl, "allow": cfg.Allow.String(),
+		"mode": cfg.Mode.String(), "ssl": o.SSL, "allow": cfg.Allow.String(),
+		"hsts":            cfg.HSTS.String(),
 		"upstream_scheme": cfg.UpstreamProto(), "upstream_verify": cfg.UpstreamVerify,
 		"backup": backupPath, "result": "ok",
 	})
 	return exitOK
+}
+
+// warnHSTSDowngrade reports when a re-render weakens the HSTS policy a host
+// was previously serving. It is advisory only — the write proceeds — but the
+// operator needs to know, because browsers keep honoring the cached directive
+// until it expires no matter what the new config says.
+//
+// A marker written before --hsts existed carries no hsts= field. Those configs
+// always emitted includeSubDomains whenever ssl=true, so an absent field on an
+// SSL vhost is reported as the subdomains policy it actually served.
+//
+// SIMPLIFIED: only reached on the real write path, since the prior marker is
+// read inside the flock and --dry-run returns before that. A dry run therefore
+// previews the weaker config without the warning; move the read ahead of the
+// dry-run return if that gap ever matters.
+func warnHSTSDowngrade(w io.Writer, host string, prev marker.Header, next render.HSTS) {
+	was := render.HSTSOff
+	switch prev.HSTS {
+	case "on":
+		was = render.HSTSOn
+	case "subdomains":
+		was = render.HSTSSubdomains
+	case "preload":
+		was = render.HSTSPreload
+	case "":
+		if prev.SSL {
+			was = render.HSTSSubdomains
+		}
+	}
+	if was <= next {
+		return
+	}
+	fmt.Fprintf(w, "note: %s previously sent HSTS (%s); this run writes %s.\n", host, was, next)
+	fmt.Fprintf(w, "      Pass --hsts=%s to keep it. Browsers honor the cached directive\n", was)
+	fmt.Fprintln(w, "      until it expires (up to 2y) regardless of this config.")
 }
 
 func rollback(d Deps, target, backup string) {
@@ -584,8 +677,8 @@ func runList(d Deps) int {
 		return exitSystemErr
 	}
 	type row struct {
-		host, mode, allow, ts, enabled string
-		ssl                            bool
+		host, mode, allow, hsts, ts, enabled string
+		ssl                                  bool
 	}
 	var rows []row
 	for _, e := range entries {
@@ -602,15 +695,21 @@ func runList(d Deps) int {
 		if _, err := os.Lstat(linkPath); err == nil {
 			enabled = "yes"
 		}
+		// Configs written before --hsts existed carry no hsts= field; "?"
+		// rather than "off" so an unknown policy isn't read as a known-safe one.
+		hsts := h.HSTS
+		if hsts == "" {
+			hsts = "?"
+		}
 		rows = append(rows, row{
-			host: h.Host, mode: h.Mode, ssl: h.SSL, allow: h.Allow,
+			host: h.Host, mode: h.Mode, ssl: h.SSL, allow: h.Allow, hsts: hsts,
 			ts: h.TS.Format(time.RFC3339), enabled: enabled,
 		})
 	}
 	slices.SortFunc(rows, func(a, b row) int { return cmp.Compare(a.host, b.host) })
 	for _, r := range rows {
-		fmt.Fprintf(d.Stdout, "%-40s mode=%-6s ssl=%-5t allow=%-10s enabled=%s ts=%s\n",
-			r.host, r.mode, r.ssl, r.allow, r.enabled, r.ts)
+		fmt.Fprintf(d.Stdout, "%-40s mode=%-6s ssl=%-5t allow=%-10s hsts=%-10s enabled=%s ts=%s\n",
+			r.host, r.mode, r.ssl, r.allow, r.hsts, r.enabled, r.ts)
 	}
 	return exitOK
 }

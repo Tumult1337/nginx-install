@@ -28,13 +28,18 @@ type Header struct {
 	Mode  string // KindVhost only: "proxy" | "static"
 	SSL   bool   // KindVhost only
 	Allow string // KindVhost only: "none" | "cf" | "list:<n>"
+	HSTS  string // KindVhost only: "off" | "on" | "subdomains" | "preload"
 	TS    time.Time
 }
 
-func RenderVhost(host, mode string, ssl bool, allow string, now time.Time) string {
+// RenderVhost writes the two-line marker for a vhost config. It takes a Header
+// rather than positional arguments because the field list is now mostly
+// same-typed strings, where a transposed pair would silently mislabel a file.
+// h.Kind is ignored; the output is always kind=vhost.
+func RenderVhost(h Header) string {
 	return FirstLine + "\n" +
-		fmt.Sprintf("# kind=vhost host=%s mode=%s ssl=%t allow=%s ts=%s\n",
-			host, mode, ssl, allow, now.UTC().Format(time.RFC3339))
+		fmt.Sprintf("# kind=vhost host=%s mode=%s ssl=%t allow=%s hsts=%s ts=%s\n",
+			h.Host, h.Mode, h.SSL, h.Allow, h.HSTS, h.TS.UTC().Format(time.RFC3339))
 }
 
 func RenderMain(now time.Time) string {
@@ -81,6 +86,8 @@ func parseFields(s string) (Header, bool) {
 			h.SSL = v == "true"
 		case "allow":
 			h.Allow = v
+		case "hsts":
+			h.HSTS = v
 		case "ts":
 			if t, err := time.Parse(time.RFC3339, v); err == nil {
 				h.TS = t

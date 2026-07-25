@@ -22,13 +22,13 @@ func tempLayout(t *testing.T) Layout {
 	t.Helper()
 	dir := t.TempDir()
 	return Layout{
-		SitesAvailable:    filepath.Join(dir, "sites-available"),
-		SitesEnabled:      filepath.Join(dir, "sites-enabled"),
-		MainConfPath:      filepath.Join(dir, "nginx.conf"),
-		BackupDir:         filepath.Join(dir, "backups"),
-		LockPath:          filepath.Join(dir, "lock"),
-		SnippetPath:       filepath.Join(dir, "snippets/cf-allow.conf"),
-		CachePath:         filepath.Join(dir, "lib/cf-allow.conf"),
+		SitesAvailable:     filepath.Join(dir, "sites-available"),
+		SitesEnabled:       filepath.Join(dir, "sites-enabled"),
+		MainConfPath:       filepath.Join(dir, "nginx.conf"),
+		BackupDir:          filepath.Join(dir, "backups"),
+		LockPath:           filepath.Join(dir, "lock"),
+		SnippetPath:        filepath.Join(dir, "snippets/cf-allow.conf"),
+		CachePath:          filepath.Join(dir, "lib/cf-allow.conf"),
 		CertDir:            filepath.Join(dir, "letsencrypt"),
 		SysctlPath:         filepath.Join(dir, "sysctl.d/99-nginx.conf"),
 		SystemdOverrideDir: filepath.Join(dir, "systemd/nginx.service.d"),
@@ -154,7 +154,7 @@ func TestRunVhostProxySSLCF(t *testing.T) {
 	d, exec, _, stderr := defaultDepsFor(t)
 	seedCert(t, d.Layout, "p.example.com")
 
-	code := Run([]string{"--allow=cf", "p.example.com", "10.0.0.1:8080"}, d)
+	code := Run([]string{"--allow=cf", "--hsts=on", "p.example.com", "10.0.0.1:8080"}, d)
 	if code != exitOK {
 		t.Fatalf("exit=%d stderr=%s", code, stderr)
 	}
@@ -291,7 +291,7 @@ func TestRunRollbackOnTestFailure(t *testing.T) {
 	target := filepath.Join(d.Layout.SitesAvailable, "r.example.com.conf")
 
 	// Pre-seed a managed file so we can verify it's restored.
-	prior := []byte(marker.RenderVhost("r.example.com", "static", false, "none", fixedNow) +
+	prior := []byte(marker.RenderVhost(marker.Header{Host: "r.example.com", Mode: "static", Allow: "none", HSTS: "off", TS: fixedNow}) +
 		"server { listen 80; server_name r.example.com; root /var/www/old; }\n")
 	_ = os.MkdirAll(d.Layout.SitesAvailable, 0755)
 	_ = os.WriteFile(target, prior, 0644)
@@ -1197,5 +1197,140 @@ func TestRunDryRunNoFSChange(t *testing.T) {
 	}
 	if exec.called("nginx") || exec.called("systemctl") {
 		t.Errorf("dry-run should not exec nginx/systemctl")
+	}
+}
+
+// ---- HSTS ----
+
+func TestHSTSRequiresSSL(t *testing.T) {
+	// Browsers ignore HSTS over plain HTTP (RFC 6797 §8.1). Silently honoring
+	// this combination would emit a config that reads as hardened but isn't,
+	// so it must fail closed with a user error.
+	for _, val := range []string{"on", "subdomains", "preload"} {
+		d, _, _, stderr := defaultDepsFor(t)
+		htmlDir := t.TempDir()
+		code := Run([]string{"--ssl=false", "--hsts=" + val, "h.example.com", htmlDir}, d)
+		if code != exitUserError {
+			t.Errorf("--hsts=%s --ssl=false: exit=%d, want %d", val, code, exitUserError)
+		}
+		if !strings.Contains(stderr.String(), "requires --ssl") {
+			t.Errorf("--hsts=%s: stderr missing explanation: %s", val, stderr)
+		}
+	}
+	// off is the default and must remain compatible with --ssl=false.
+	d, _, _, stderr := defaultDepsFor(t)
+	htmlDir := t.TempDir()
+	if code := Run([]string{"--ssl=false", "--hsts=off", "h.example.com", htmlDir}, d); code != exitOK {
+		t.Errorf("--hsts=off --ssl=false: exit=%d stderr=%s", code, stderr)
+	}
+}
+
+func TestHSTSInvalidValueRejected(t *testing.T) {
+	d, _, _, stderr := defaultDepsFor(t)
+	seedCert(t, d.Layout, "h.example.com")
+	code := Run([]string{"--hsts=true", "h.example.com", "10.0.0.1:8080"}, d)
+	if code != exitUserError {
+		t.Fatalf("exit=%d, want %d (stderr=%s)", code, exitUserError, stderr)
+	}
+	if !strings.Contains(stderr.String(), "invalid --hsts value") {
+		t.Errorf("stderr missing explanation: %s", stderr)
+	}
+	// Must not have written anything.
+	if _, err := os.Stat(filepath.Join(d.Layout.SitesAvailable, "h.example.com.conf")); err == nil {
+		t.Error("rejected --hsts wrote a config anyway")
+	}
+}
+
+func TestHSTSDefaultIsOff(t *testing.T) {
+	d, _, _, stderr := defaultDepsFor(t)
+	seedCert(t, d.Layout, "h.example.com")
+	if code := Run([]string{"h.example.com", "10.0.0.1:8080"}, d); code != exitOK {
+		t.Fatalf("exit=%d stderr=%s", code, stderr)
+	}
+	b, err := os.ReadFile(filepath.Join(d.Layout.SitesAvailable, "h.example.com.conf"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Contains(b, []byte("Strict-Transport-Security")) {
+		t.Errorf("default must not emit HSTS:\n%s", b)
+	}
+	if !bytes.Contains(b, []byte("hsts=off")) {
+		t.Errorf("marker missing hsts=off:\n%s", b)
+	}
+}
+
+func TestHSTSDowngradeWarns(t *testing.T) {
+	cases := []struct {
+		name     string
+		first    []string // args for the first write
+		second   []string // args for the re-render
+		wantWarn bool
+		wantWas  string
+	}{
+		{"subdomains -> off", []string{"--hsts=subdomains"}, nil, true, "subdomains"},
+		{"preload -> on", []string{"--hsts=preload"}, []string{"--hsts=on"}, true, "preload"},
+		{"on -> on", []string{"--hsts=on"}, []string{"--hsts=on"}, false, ""},
+		{"off -> subdomains", nil, []string{"--hsts=subdomains"}, false, ""},
+		{"on -> subdomains", []string{"--hsts=on"}, []string{"--hsts=subdomains"}, false, ""},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			d, _, _, stderr := defaultDepsFor(t)
+			seedCert(t, d.Layout, "h.example.com")
+			if code := Run(append(c.first, "h.example.com", "10.0.0.1:8080"), d); code != exitOK {
+				t.Fatalf("first write: exit=%d stderr=%s", code, stderr)
+			}
+			stderr.Reset()
+			if code := Run(append(c.second, "h.example.com", "10.0.0.1:8080"), d); code != exitOK {
+				t.Fatalf("re-render: exit=%d stderr=%s", code, stderr)
+			}
+			got := strings.Contains(stderr.String(), "previously sent HSTS")
+			if got != c.wantWarn {
+				t.Errorf("warn=%v want=%v, stderr=%s", got, c.wantWarn, stderr)
+			}
+			if c.wantWarn && !strings.Contains(stderr.String(), c.wantWas) {
+				t.Errorf("warning missing prior policy %q: %s", c.wantWas, stderr)
+			}
+		})
+	}
+}
+
+// A config written before --hsts existed has no hsts= field but always served
+// includeSubDomains when ssl=true. Re-rendering it without --hsts silently
+// stops sending that header, so the warning has to fire on the inferred value.
+func TestHSTSDowngradeWarnsForPreFlagMarker(t *testing.T) {
+	d, _, _, stderr := defaultDepsFor(t)
+	seedCert(t, d.Layout, "h.example.com")
+	target := filepath.Join(d.Layout.SitesAvailable, "h.example.com.conf")
+	if err := os.MkdirAll(d.Layout.SitesAvailable, 0755); err != nil {
+		t.Fatal(err)
+	}
+	legacy := "# Managed by nginx-gen. Do not edit by hand.\n" +
+		"# kind=vhost host=h.example.com mode=proxy ssl=true allow=none ts=2026-05-03T12:00:00Z\n" +
+		"server { listen 443 ssl; }\n"
+	if err := os.WriteFile(target, []byte(legacy), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	if code := Run([]string{"h.example.com", "10.0.0.1:8080"}, d); code != exitOK {
+		t.Fatalf("exit=%d stderr=%s", code, stderr)
+	}
+	if !strings.Contains(stderr.String(), "previously sent HSTS (subdomains)") {
+		t.Errorf("pre-flag marker should infer subdomains: %s", stderr)
+	}
+}
+
+func TestListShowsHSTS(t *testing.T) {
+	d, _, stdout, stderr := defaultDepsFor(t)
+	seedCert(t, d.Layout, "h.example.com")
+	if code := Run([]string{"--hsts=subdomains", "h.example.com", "10.0.0.1:8080"}, d); code != exitOK {
+		t.Fatalf("exit=%d stderr=%s", code, stderr)
+	}
+	stdout.Reset()
+	if code := Run([]string{"--list"}, d); code != exitOK {
+		t.Fatalf("list exit=%d stderr=%s", code, stderr)
+	}
+	if !strings.Contains(stdout.String(), "hsts=subdomains") {
+		t.Errorf("--list missing hsts column: %s", stdout)
 	}
 }

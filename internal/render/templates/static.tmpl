@@ -19,7 +19,9 @@ server {
 
     ssl_certificate     {{ .CertDir }}/fullchain.pem;
     ssl_certificate_key {{ .CertDir }}/privkey.pem;
-    add_header Strict-Transport-Security "max-age=63072000; includeSubDomains" always;
+{{- with .HSTSHeader }}
+    add_header Strict-Transport-Security "{{ . }}" always;
+{{- end }}
 {{- if .IsCF }}
 
     # Cloudflare Origin CA has no OCSP responder; disable stapling to avoid
@@ -59,6 +61,13 @@ server {
 
     location ~* \.(?:css|js|woff2?|ttf|otf|svg|png|jpg|jpeg|gif|webp|avif|ico)$ {
         expires 30d;
+{{- with .HSTSHeader }}
+        # Restates the server-level HSTS: add_header inherits from the parent
+        # level only when the current level declares none, so the
+        # Cache-Control below would otherwise drop HSTS from every asset
+        # response. Same inheritance trap as proxy_set_header in proxy.tmpl.
+        add_header Strict-Transport-Security "{{ . }}" always;
+{{- end }}
         add_header Cache-Control "public, immutable";
         try_files $uri =404;
     }
