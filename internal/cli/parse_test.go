@@ -79,11 +79,26 @@ func TestParseUpstream(t *testing.T) {
 }
 
 func TestUpstreamName(t *testing.T) {
-	if got := UpstreamName("a.example.com"); got != "a_example_com_up" {
+	if got := UpstreamName("a.example.com"); !strings.HasPrefix(got, "a_example_com_") || !strings.HasSuffix(got, "_up") {
 		t.Errorf("UpstreamName: %q", got)
 	}
-	if got := UpstreamName("api-v2.example.com"); got != "api_v2_example_com_up" {
+	if got := UpstreamName("api-v2.example.com"); !strings.HasPrefix(got, "api_v2_example_com_") || !strings.HasSuffix(got, "_up") {
 		t.Errorf("UpstreamName with dash: %q", got)
+	}
+}
+
+// Both "." and "-" map to "_", so distinct hosts would collide without the hash
+// HostIdent appends. nginx rejects a duplicate upstream/zone name at load.
+func TestHostIdentInjective(t *testing.T) {
+	a, b := HostIdent("a-b.example.com"), HostIdent("a.b.example.com")
+	if a == b {
+		t.Errorf("HostIdent collides for a-b.example.com and a.b.example.com: %q", a)
+	}
+	for _, r := range a {
+		ok := r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' || r == '_'
+		if !ok {
+			t.Errorf("HostIdent(%q)=%q has non-identifier rune %q", "a-b.example.com", a, r)
+		}
 	}
 }
 
@@ -195,5 +210,44 @@ func TestHSTSKindOrdering(t *testing.T) {
 	// warnHSTSDowngrade compares these with <, so the order is load-bearing.
 	if HSTSOff >= HSTSOn || HSTSOn >= HSTSSubdomains || HSTSSubdomains >= HSTSPreload {
 		t.Error("HSTSKind constants are not ordered by blast radius")
+	}
+}
+
+func TestParseRateLimit(t *testing.T) {
+	cases := []struct {
+		in      string
+		want    RateLimit
+		wantErr bool
+	}{
+		{"", RateLimit{}, false}, // absent → disabled
+		{"true", RateLimit{Enabled: true, Rate: "50r/s", Burst: 100, Conn: 100}, false},  // bare flag
+		{"10r/s", RateLimit{Enabled: true, Rate: "10r/s", Burst: 100, Conn: 100}, false}, // rate only, default burst
+		{"10r/s:5", RateLimit{Enabled: true, Rate: "10r/s", Burst: 5, Conn: 100}, false},
+		{"100r/m:0", RateLimit{Enabled: true, Rate: "100r/m", Burst: 0, Conn: 100}, false}, // burst 0 is valid
+		{"  30r/s : 20 ", RateLimit{Enabled: true, Rate: "30r/s", Burst: 20, Conn: 100}, false},
+		{"+50r/s", RateLimit{Enabled: true, Rate: "50r/s", Burst: 100, Conn: 100}, false}, // normalized, sign dropped
+		// Unhappy paths: reject rather than degrade. A bad value must not
+		// silently produce an unlimited or malformed config.
+		{"50", RateLimit{}, true},           // missing unit
+		{"50r/h", RateLimit{}, true},        // bad unit
+		{"0r/s", RateLimit{}, true},         // rate must be ≥ 1
+		{"abcr/s", RateLimit{}, true},       // non-numeric rate
+		{"10r/s:-1", RateLimit{}, true},     // negative burst
+		{"10r/s:abc", RateLimit{}, true},    // non-numeric burst
+		{"10r/s:999999", RateLimit{}, true}, // burst above bound
+		// Config-injection attempts must be rejected, never written into nginx.conf.
+		{"1r/s; deny all", RateLimit{}, true},
+		{"1r/s\ninjected", RateLimit{}, true},
+		{"1r/s:100}", RateLimit{}, true},
+	}
+	for _, c := range cases {
+		got, err := ParseRateLimit(c.in)
+		if (err != nil) != c.wantErr {
+			t.Errorf("ParseRateLimit(%q): err=%v wantErr=%v", c.in, err, c.wantErr)
+			continue
+		}
+		if err == nil && got != c.want {
+			t.Errorf("ParseRateLimit(%q) = %+v, want %+v", c.in, got, c.want)
+		}
 	}
 }

@@ -224,8 +224,8 @@ func TestStaticNoSSLWithList(t *testing.T) {
 	mustContain(t, s, "allow 10.0.0.0/8;")
 	mustContain(t, s, "allow 192.168.1.0/24;")
 	mustContain(t, s, "deny all;")
-	mustContain(t, s, "limit_conn perip 100;") // non-CF → TCP-peer key
-	mustNotContain(t, s, "perip_cf")
+	mustNotContain(t, s, "limit_conn") // rate limiting is opt-in; not requested here
+	mustNotContain(t, s, "limit_req")
 	if strings.Contains(s, "snippets/cf-allow") {
 		t.Error("AllowList should not emit cf-allow include")
 	}
@@ -251,6 +251,125 @@ func TestStaticAllowNoneNoDeny(t *testing.T) {
 	}
 }
 
+func TestVhostRateLimitOptInDefault(t *testing.T) {
+	cfg := VhostCfg{
+		Host:           "a.example.com",
+		Mode:           ModeProxy,
+		SSL:            false,
+		Upstream:       "10.0.0.1:8080",
+		UpstreamName:   "a_example_com_up",
+		RateLimit:      true,
+		RateLimitRate:  "50r/s",
+		RateLimitBurst: 100,
+		RateLimitConn:  100,
+		Now:            fixedTime,
+	}
+	out, err := Vhost(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := string(out)
+	// Per-vhost zones, keyed on the host, defined at http scope in the file.
+	req, conn := cfg.ReqZone(), cfg.ConnZone()
+	mustContain(t, s, "limit_req_zone  $binary_remote_addr zone="+req+":10m rate=50r/s;")
+	mustContain(t, s, "limit_conn_zone $binary_remote_addr zone="+conn+":10m;")
+	mustContain(t, s, "limit_conn "+conn+" 100;")
+	mustContain(t, s, "limit_req  zone="+req+" burst=100 nodelay;")
+	// Shared global zone names from the pre-opt-in design must be gone.
+	mustNotContain(t, s, "zone=reqip")
+	mustNotContain(t, s, "zone=perip")
+	mustContain(t, s, "ratelimit=50r/s:100")
+}
+
+func TestVhostRateLimitOptInCustom(t *testing.T) {
+	cfg := VhostCfg{
+		Host:           "b.example.com",
+		Mode:           ModeStatic,
+		SSL:            false,
+		Root:           "/var/www/b",
+		RateLimit:      true,
+		RateLimitRate:  "10r/m",
+		RateLimitBurst: 5,
+		RateLimitConn:  100,
+		Now:            fixedTime,
+	}
+	out, err := Vhost(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := string(out)
+	req := cfg.ReqZone()
+	mustContain(t, s, "zone="+req+":10m rate=10r/m;")
+	mustContain(t, s, "limit_req  zone="+req+" burst=5 nodelay;")
+	mustContain(t, s, "ratelimit=10r/m:5")
+}
+
+// Distinct hosts must never share a zone name: nginx rejects a duplicate zone
+// at load. The readable prefix alone collides because both "." and "-" map to
+// "_", so ReqZone/ConnZone mix in a hash of the exact host.
+func TestVhostRateLimitZoneNamesInjective(t *testing.T) {
+	a := VhostCfg{Host: "a-b.example.com"}
+	b := VhostCfg{Host: "a.b.example.com"}
+	if a.ReqZone() == b.ReqZone() || a.ConnZone() == b.ConnZone() {
+		t.Errorf("zone names collide for %q vs %q: req %q/%q conn %q/%q",
+			a.Host, b.Host, a.ReqZone(), b.ReqZone(), a.ConnZone(), b.ConnZone())
+	}
+	for _, z := range []string{a.ReqZone(), a.ConnZone()} {
+		for _, r := range z {
+			ok := r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' || r == '_'
+			if !ok {
+				t.Errorf("zone name %q has non-identifier rune %q", z, r)
+			}
+		}
+	}
+}
+
+func TestVhostRateLimitOptOut(t *testing.T) {
+	cfg := VhostCfg{
+		Host:         "c.example.com",
+		Mode:         ModeProxy,
+		SSL:          false,
+		Upstream:     "10.0.0.1:8080",
+		UpstreamName: "c_example_com_up",
+		Now:          fixedTime,
+	}
+	out, err := Vhost(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := string(out)
+	mustNotContain(t, s, "limit_req")
+	mustNotContain(t, s, "limit_conn")
+	mustContain(t, s, "ratelimit=off")
+}
+
+// Even if a caller sets RateLimit under --allow=cf, no directives are emitted:
+// the key would be the Cloudflare edge IP. The marker records "off" to match.
+func TestVhostRateLimitSuppressedUnderCF(t *testing.T) {
+	cfg := VhostCfg{
+		Host:           "d.example.com",
+		Mode:           ModeProxy,
+		SSL:            true,
+		CertDir:        "/etc/letsencrypt/live/example.com",
+		Allow:          AllowCF,
+		Upstream:       "10.0.0.1:8080",
+		UpstreamName:   "d_example_com_up",
+		RateLimit:      true,
+		RateLimitRate:  "50r/s",
+		RateLimitBurst: 100,
+		RateLimitConn:  100,
+		Now:            fixedTime,
+	}
+	out, err := Vhost(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := string(out)
+	mustNotContain(t, s, "limit_req_zone")
+	mustNotContain(t, s, "limit_conn")
+	mustContain(t, s, "ratelimit=off")
+}
+
 func TestMain(t *testing.T) {
 	out, err := Main(MainCfg{Now: fixedTime})
 	if err != nil {
@@ -259,8 +378,9 @@ func TestMain(t *testing.T) {
 	s := string(out)
 	mustContain(t, s, "# Managed by nginx-gen.")
 	mustContain(t, s, "kind=main ts=2026-05-03T12:00:00Z")
-	mustContain(t, s, "limit_conn_zone $binary_remote_addr zone=perip:32m;")
-	mustContain(t, s, "limit_req_zone  $binary_remote_addr zone=reqip:32m")
+	// Rate-limit zones are per-vhost now (opt-in), not global in nginx.conf.
+	mustNotContain(t, s, "limit_conn_zone")
+	mustNotContain(t, s, "limit_req_zone")
 	mustNotContain(t, s, "perip_cf")
 	mustNotContain(t, s, "reqip_cf")
 	mustNotContain(t, s, "$cf_rl_key")

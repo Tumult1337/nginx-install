@@ -23,13 +23,14 @@ const (
 )
 
 type Header struct {
-	Kind  Kind
-	Host  string // KindVhost only
-	Mode  string // KindVhost only: "proxy" | "static"
-	SSL   bool   // KindVhost only
-	Allow string // KindVhost only: "none" | "cf" | "list:<n>"
-	HSTS  string // KindVhost only: "off" | "on" | "subdomains" | "preload"
-	TS    time.Time
+	Kind      Kind
+	Host      string // KindVhost only
+	Mode      string // KindVhost only: "proxy" | "static"
+	SSL       bool   // KindVhost only
+	Allow     string // KindVhost only: "none" | "cf" | "list:<n>"
+	HSTS      string // KindVhost only: "off" | "on" | "subdomains" | "preload"
+	RateLimit string // KindVhost only: "off" | "<rate>:<burst>"; "" in files written before the flag existed
+	TS        time.Time
 }
 
 // RenderVhost writes the two-line marker for a vhost config. It takes a Header
@@ -38,8 +39,8 @@ type Header struct {
 // h.Kind is ignored; the output is always kind=vhost.
 func RenderVhost(h Header) string {
 	return FirstLine + "\n" +
-		fmt.Sprintf("# kind=vhost host=%s mode=%s ssl=%t allow=%s hsts=%s ts=%s\n",
-			h.Host, h.Mode, h.SSL, h.Allow, h.HSTS, h.TS.UTC().Format(time.RFC3339))
+		fmt.Sprintf("# kind=vhost host=%s mode=%s ssl=%t allow=%s hsts=%s ratelimit=%s ts=%s\n",
+			h.Host, h.Mode, h.SSL, h.Allow, h.HSTS, h.RateLimit, h.TS.UTC().Format(time.RFC3339))
 }
 
 func RenderMain(now time.Time) string {
@@ -88,6 +89,8 @@ func parseFields(s string) (Header, bool) {
 			h.Allow = v
 		case "hsts":
 			h.HSTS = v
+		case "ratelimit":
+			h.RateLimit = v
 		case "ts":
 			if t, err := time.Parse(time.RFC3339, v); err == nil {
 				h.TS = t

@@ -101,10 +101,6 @@ http {
     # HTTP/2
     http2_max_concurrent_streams 128;
 
-    # Rate-limit / connection-limit zones (referenced by non-CF vhost configs).
-    limit_conn_zone $binary_remote_addr zone=perip:32m;
-    limit_req_zone  $binary_remote_addr zone=reqip:32m rate=50r/s;
-
     # WebSocket upgrade support. Defined once here (map must be unique per
     # http block) so per-vhost location blocks in proxy.tmpl can reference
     # $connection_upgrade without redeclaring it. Empty $http_upgrade (the

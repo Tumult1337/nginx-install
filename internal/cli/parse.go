@@ -4,9 +4,11 @@ package cli
 
 import (
 	"fmt"
+	"hash/crc32"
 	"net"
 	"net/netip"
 	"os"
+	"strconv"
 	"strings"
 )
 
@@ -88,11 +90,20 @@ func ParseUpstream(arg string) (scheme, hostport string, err error) {
 	return scheme, fmt.Sprintf("%s:%s", arg, defPort), nil
 }
 
-// UpstreamName builds a safe identifier for nginx's `upstream {}` block from
-// a host name. Dots and dashes become underscores; suffix `_up`.
+// HostIdent maps a validated host name to a unique nginx identifier. Both "."
+// and "-" become "_", which is not injective on its own ("a-b.x" and "a.b.x"
+// collapse together), so a CRC32 of the exact host is appended. Two vhosts must
+// never derive the same identifier: nginx rejects a duplicate `upstream` block
+// or `limit_req_zone`/`limit_conn_zone` name at config load. Callers add a role
+// suffix (e.g. "_up", "_req") for the final name.
+func HostIdent(host string) string {
+	safe := strings.NewReplacer(".", "_", "-", "_").Replace(host)
+	return fmt.Sprintf("%s_%08x", safe, crc32.ChecksumIEEE([]byte(host)))
+}
+
+// UpstreamName builds the identifier for a vhost's nginx `upstream {}` block.
 func UpstreamName(host string) string {
-	r := strings.NewReplacer(".", "_", "-", "_")
-	return r.Replace(host) + "_up"
+	return HostIdent(host) + "_up"
 }
 
 // TargetKind discriminates the second positional arg.
@@ -209,4 +220,76 @@ func ParseAllow(s string) (AllowKind, []netip.Prefix, error) {
 		return AllowNone, nil, fmt.Errorf("--allow value %q produced no entries", s)
 	}
 	return AllowList, prefixes, nil
+}
+
+// RateLimit holds the parsed --rate-limit value. The zero value (Enabled
+// false) means the vhost emits no limit_req/limit_conn directives.
+type RateLimit struct {
+	Enabled bool
+	Rate    string // normalized nginx rate token, e.g. "50r/s"
+	Burst   int    // limit_req burst
+	Conn    int    // limit_conn per-IP connection cap
+}
+
+const (
+	rateLimitDefaultRate  = "50r/s"
+	rateLimitDefaultBurst = 100
+	rateLimitConn         = 100    // per-IP connection cap (not configurable via --rate-limit)
+	rateLimitMaxBurst     = 100000 // upper bound on burst; a larger value defeats the limit
+	rateLimitMaxRate      = 1000000
+)
+
+// ParseRateLimit parses a --rate-limit value into per-vhost limit_req settings.
+// Forms:
+//
+//	""               -> disabled (flag absent)
+//	"true"           -> enabled with defaults (bare --rate-limit)
+//	"<rate>"         -> enabled, given rate, default burst
+//	"<rate>:<burst>" -> enabled, given rate and burst
+//
+// <rate> is an nginx rate token: <n>r/s or <n>r/m. The value flows into a
+// generated nginx.conf, so Rate is always rebuilt from the parsed integer and
+// unit (never the raw input) to reject config injection through the flag.
+func ParseRateLimit(s string) (RateLimit, error) {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return RateLimit{}, nil
+	}
+	rl := RateLimit{
+		Enabled: true,
+		Rate:    rateLimitDefaultRate,
+		Burst:   rateLimitDefaultBurst,
+		Conn:    rateLimitConn,
+	}
+	if s == "true" { // bare --rate-limit
+		return rl, nil
+	}
+	rateSpec, burstSpec, hasBurst := strings.Cut(s, ":")
+	rate, err := normalizeRate(rateSpec)
+	if err != nil {
+		return RateLimit{}, err
+	}
+	rl.Rate = rate
+	if hasBurst {
+		b, err := strconv.Atoi(strings.TrimSpace(burstSpec))
+		if err != nil || b < 0 || b > rateLimitMaxBurst {
+			return RateLimit{}, fmt.Errorf("invalid --rate-limit burst %q: want integer 0..%d", burstSpec, rateLimitMaxBurst)
+		}
+		rl.Burst = b
+	}
+	return rl, nil
+}
+
+// normalizeRate validates an nginx rate token and returns it rebuilt from the
+// parsed integer and unit, so the rendered value can never carry stray bytes.
+func normalizeRate(s string) (string, error) {
+	num, unit, ok := strings.Cut(strings.TrimSpace(s), "r/")
+	if !ok || (unit != "s" && unit != "m") {
+		return "", fmt.Errorf("invalid --rate-limit rate %q: want <n>r/s or <n>r/m", s)
+	}
+	n, err := strconv.Atoi(num)
+	if err != nil || n < 1 || n > rateLimitMaxRate {
+		return "", fmt.Errorf("invalid --rate-limit rate %q: want <n>r/s or <n>r/m with n in 1..%d", s, rateLimitMaxRate)
+	}
+	return fmt.Sprintf("%dr/%s", n, unit), nil
 }

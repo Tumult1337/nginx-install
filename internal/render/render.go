@@ -10,6 +10,7 @@ import (
 	"text/template"
 	"time"
 
+	"nginx-gen/internal/cli"
 	"nginx-gen/internal/marker"
 )
 
@@ -96,12 +97,27 @@ type VhostCfg struct {
 	Root           string         // absolute existing dir — for static mode
 	Now            time.Time      // injectable for golden tests
 	HTTP2Inline    bool           // true → emit `listen 443 ssl http2;` (nginx < 1.25.1)
+
+	RateLimit      bool   // opt-in: emit per-vhost limit_req/limit_conn (suppressed under CF)
+	RateLimitRate  string // normalized nginx rate token, e.g. "50r/s"
+	RateLimitBurst int    // limit_req burst
+	RateLimitConn  int    // limit_conn per-IP connection cap
 }
 
 // Template-friendly accessors. text/template can't compare against AllowSpec
 // constants from outside the package, so expose booleans instead.
 func (c VhostCfg) IsCF() bool   { return c.Allow == AllowCF }
 func (c VhostCfg) IsList() bool { return c.Allow == AllowList && len(c.AllowCIDRs) > 0 }
+
+// RateLimited reports whether the vhost emits rate-limit directives. CF vhosts
+// never do: the key would be $binary_remote_addr, which under Cloudflare is the
+// edge IP, so the limit would throttle all clients behind one edge together.
+func (c VhostCfg) RateLimited() bool { return c.RateLimit && c.Allow != AllowCF }
+
+// ReqZone and ConnZone are the per-vhost zone names. cli.HostIdent guarantees
+// distinct hosts never collide on one name, which nginx rejects at load.
+func (c VhostCfg) ReqZone() string  { return cli.HostIdent(c.Host) + "_req" }
+func (c VhostCfg) ConnZone() string { return cli.HostIdent(c.Host) + "_conn" }
 
 // HSTSHeader returns the Strict-Transport-Security value, or "" when the
 // header should be omitted entirely. Empty without SSL: RFC 6797 §8.1 requires
@@ -142,6 +158,16 @@ func (c VhostCfg) allowField() string {
 	return "none"
 }
 
+// rateLimitField is the marker value: "off" when no directives are emitted, or
+// "<rate>:<burst>" so --list can show the applied limit. Reads RateLimited()
+// so a CF vhost that was handed --rate-limit records "off", matching the file.
+func (c VhostCfg) rateLimitField() string {
+	if !c.RateLimited() {
+		return "off"
+	}
+	return fmt.Sprintf("%s:%d", c.RateLimitRate, c.RateLimitBurst)
+}
+
 //go:embed templates/*.tmpl
 var tmplFS embed.FS
 
@@ -160,12 +186,13 @@ func Vhost(cfg VhostCfg) ([]byte, error) {
 
 	var buf bytes.Buffer
 	buf.WriteString(marker.RenderVhost(marker.Header{
-		Host:  cfg.Host,
-		Mode:  cfg.Mode.String(),
-		SSL:   cfg.SSL,
-		Allow: cfg.allowField(),
-		HSTS:  cfg.HSTS.String(),
-		TS:    cfg.Now,
+		Host:      cfg.Host,
+		Mode:      cfg.Mode.String(),
+		SSL:       cfg.SSL,
+		Allow:     cfg.allowField(),
+		HSTS:      cfg.HSTS.String(),
+		RateLimit: cfg.rateLimitField(),
+		TS:        cfg.Now,
 	}))
 	if err := t.Execute(&buf, cfg); err != nil {
 		return nil, fmt.Errorf("render %s: %w", tmplName, err)

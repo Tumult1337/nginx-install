@@ -138,6 +138,7 @@ nginx-gen --list
 | `--proxy-ssl-verify`| `false`              | Verify the backend cert (only for `https://` upstreams). Off = encrypt but don't authenticate; needed for IP/self-signed backends. |
 | `--allow`           | unset                | `cf` → Cloudflare IPs. Or comma-separated CIDRs/IPs. |
 | `--hsts`            | `off`                | `on` → this host only. `subdomains`, `preload` → see [HSTS](#--hsts) before using. Requires `--ssl`. |
+| `--rate-limit`      | `off`                | Opt-in per-vhost rate limiting. Bare `--rate-limit` = `50r/s`, burst 100. `--rate-limit=rate:burst` (e.g. `50r/s:100`) sets both. Ignored with `--allow=cf`. See [Rate limiting](#rate-limiting). |
 | `--cert-dir`        | `/etc/letsencrypt/live` | Cert lookup base. Also `$NGINX_CERT_DIR`. |
 | `--brotli`          | `auto`               | `auto` = best-effort. `on` = require/build. `off` = skip entirely. |
 | `--channel`         | `mainline`           | nginx.org repo channel (only for `--install` / `--bootstrap`). |
@@ -271,6 +272,44 @@ HTTPS from the affected host until clients revisit, which this tool does not
 generate — hand-edit the vhost for that. Prevention is much cheaper than the
 cure, which is why `subdomains` and `preload` are opt-in.
 
+## Rate limiting
+
+Rate limiting is **opt-in per vhost** via `--rate-limit`. Without the flag a
+vhost carries no `limit_req`/`limit_conn` directives.
+
+| Form | Result |
+|---|---|
+| (flag absent) | Off. No rate-limit directives. |
+| `--rate-limit` | On with defaults: `50r/s`, burst 100, 100 connections per IP. |
+| `--rate-limit=rate:burst` | On with the given rate and burst, e.g. `--rate-limit=50r/s:100`. |
+| `--rate-limit=rate` | On with the given rate and the default burst. |
+
+`rate` is an nginx rate token: `<n>r/s` or `<n>r/m`. The value is validated and
+rebuilt before it is written, so a malformed or injected value is rejected
+rather than emitted. The connection cap stays at 100 per IP and is not
+configurable through this flag.
+
+Each opted-in vhost gets its own `limit_req_zone` and `limit_conn_zone`, keyed
+on `$binary_remote_addr`. The zone name is the host with a short hash appended
+(the hash keeps two hosts that differ only by `.` vs `-` from colliding on one
+zone name, which nginx would reject). Each zone is sized `10m` (about 160k
+client IPs per zone). The zones live in the vhost file itself, at `http` scope.
+
+`--rate-limit` is ignored with `--allow=cf` (see [`--allow=cf`](#--allowcf)):
+the key would be the Cloudflare edge IP, so the limit would throttle every
+client behind one edge together.
+
+### Upgrading from a build that rate-limited by default
+
+Earlier builds defined shared `perip`/`reqip` zones in `nginx.conf` and applied
+them to every non-CF vhost. This build removes the shared zones and makes rate
+limiting opt-in. A vhost file written by an older build still references
+`reqip`/`perip`, so **re-render each vhost before you re-render `nginx.conf`**
+(`nginx-gen --main`). The tool runs `nginx -t` before every reload, so a stale
+reference fails closed — the reload is refused and the running config keeps
+serving — but the update is blocked until the vhost is re-rendered.
+`nginx-gen --list` shows `ratelimit=?` for a vhost that predates the flag.
+
 ## `--allow=cf`
 
 Fetches Cloudflare IP ranges from `cloudflare.com/ips-{v4,v6}` and writes
@@ -279,8 +318,9 @@ failure, falls back to `/var/lib/nginx-gen/cf-allow.conf` (last good copy)
 if < 7 days old.
 
 CF vhosts restrict ingress to Cloudflare edge IPs via `allow`/`deny`. Rate
-limiting is intentionally **not** applied — CF handles that at the edge, and
-nginx rate limits keyed on CF edge IPs would 503 legitimate traffic.
+limiting is never applied to a CF vhost, even with `--rate-limit`: the key would
+be the Cloudflare edge IP, so nginx would 503 legitimate traffic once one edge
+crossed the limit. Rate-limit at the edge instead.
 
 ### Why no `set_real_ip_from`
 

@@ -1,3 +1,7 @@
+{{- if .RateLimited }}
+limit_req_zone  $binary_remote_addr zone={{ .ReqZone }}:10m rate={{ .RateLimitRate }};
+limit_conn_zone $binary_remote_addr zone={{ .ConnZone }}:10m;
+{{ end -}}
 {{- if .SSL }}
 server {
     listen 80;
@@ -55,9 +59,9 @@ server {
     deny all;
 {{- end }}
 
-{{- if not .IsCF }}
-    limit_conn perip 100;
-    limit_req  zone=reqip burst=100 nodelay;
+{{- if .RateLimited }}
+    limit_conn {{ .ConnZone }} {{ .RateLimitConn }};
+    limit_req  zone={{ .ReqZone }} burst={{ .RateLimitBurst }} nodelay;
 {{- end }}
 
     location / {

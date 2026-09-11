@@ -12,8 +12,10 @@ import (
 	"testing"
 	"time"
 
+	"nginx-gen/internal/cli"
 	"nginx-gen/internal/marker"
 	"nginx-gen/internal/nginx"
+	"nginx-gen/internal/render"
 )
 
 var fixedNow = time.Date(2026, 5, 3, 12, 0, 0, 0, time.UTC)
@@ -164,7 +166,7 @@ func TestRunVhostProxySSLCF(t *testing.T) {
 	}
 	for _, want := range []string{
 		"include /etc/nginx/snippets/cf-allow.conf",
-		"upstream p_example_com_up {",
+		"upstream " + cli.UpstreamName("p.example.com") + " {",
 		"Strict-Transport-Security",
 		"return 301 https://$host$request_uri;",
 	} {
@@ -222,6 +224,115 @@ func TestRunAllowCIDRList(t *testing.T) {
 		if !bytes.Contains(b, []byte(want)) {
 			t.Errorf("missing %q\n%s", want, b)
 		}
+	}
+}
+
+// Rate limiting is opt-in: a vhost written without --rate-limit emits no
+// limit_req/limit_conn directives.
+func TestRunVhostRateLimitDefaultOff(t *testing.T) {
+	d, _, _, stderr := defaultDepsFor(t)
+	htmlDir := t.TempDir()
+	if code := Run([]string{"--ssl=false", "s.example.com", htmlDir}, d); code != exitOK {
+		t.Fatalf("exit=%d stderr=%s", code, stderr)
+	}
+	b, _ := os.ReadFile(filepath.Join(d.Layout.SitesAvailable, "s.example.com.conf"))
+	s := string(b)
+	if strings.Contains(s, "limit_req") || strings.Contains(s, "limit_conn") {
+		t.Errorf("default must emit no rate-limit directives:\n%s", s)
+	}
+	if !strings.Contains(s, "ratelimit=off") {
+		t.Errorf("marker must record ratelimit=off:\n%s", s)
+	}
+}
+
+// --rate-limit=<rate>:<burst> emits per-vhost zones keyed on the host and the
+// requested rate/burst.
+func TestRunVhostRateLimitOptIn(t *testing.T) {
+	d, _, _, stderr := defaultDepsFor(t)
+	htmlDir := t.TempDir()
+	if code := Run([]string{"--ssl=false", "--rate-limit=20r/s:50", "s.example.com", htmlDir}, d); code != exitOK {
+		t.Fatalf("exit=%d stderr=%s", code, stderr)
+	}
+	b, _ := os.ReadFile(filepath.Join(d.Layout.SitesAvailable, "s.example.com.conf"))
+	zc := render.VhostCfg{Host: "s.example.com"}
+	req, conn := zc.ReqZone(), zc.ConnZone()
+	for _, want := range []string{
+		"limit_req_zone  $binary_remote_addr zone=" + req + ":10m rate=20r/s;",
+		"limit_conn_zone $binary_remote_addr zone=" + conn + ":10m;",
+		"limit_conn " + conn + " 100;",
+		"limit_req  zone=" + req + " burst=50 nodelay;",
+		"ratelimit=20r/s:50",
+	} {
+		if !bytes.Contains(b, []byte(want)) {
+			t.Errorf("missing %q\n%s", want, b)
+		}
+	}
+}
+
+// --rate-limit=false disables (bool-flag convention), same as omitting it.
+func TestRunVhostRateLimitFalseDisables(t *testing.T) {
+	d, _, _, stderr := defaultDepsFor(t)
+	htmlDir := t.TempDir()
+	if code := Run([]string{"--ssl=false", "--rate-limit=false", "s.example.com", htmlDir}, d); code != exitOK {
+		t.Fatalf("exit=%d stderr=%s", code, stderr)
+	}
+	b, _ := os.ReadFile(filepath.Join(d.Layout.SitesAvailable, "s.example.com.conf"))
+	s := string(b)
+	if strings.Contains(s, "limit_req") || strings.Contains(s, "limit_conn") {
+		t.Errorf("--rate-limit=false must emit no directives:\n%s", s)
+	}
+	if !strings.Contains(s, "ratelimit=off") {
+		t.Errorf("--rate-limit=false must record ratelimit=off:\n%s", s)
+	}
+}
+
+// A bare --rate-limit uses the defaults.
+func TestRunVhostRateLimitBareDefaults(t *testing.T) {
+	d, _, _, stderr := defaultDepsFor(t)
+	htmlDir := t.TempDir()
+	if code := Run([]string{"--ssl=false", "--rate-limit", "s.example.com", htmlDir}, d); code != exitOK {
+		t.Fatalf("exit=%d stderr=%s", code, stderr)
+	}
+	b, _ := os.ReadFile(filepath.Join(d.Layout.SitesAvailable, "s.example.com.conf"))
+	if !bytes.Contains(b, []byte("rate=50r/s;")) || !bytes.Contains(b, []byte("burst=100 nodelay;")) {
+		t.Errorf("bare --rate-limit must use defaults 50r/s burst 100\n%s", b)
+	}
+}
+
+// A malformed --rate-limit value is rejected before any file is written.
+func TestRunVhostRateLimitRejectsBad(t *testing.T) {
+	d, _, _, stderr := defaultDepsFor(t)
+	htmlDir := t.TempDir()
+	code := Run([]string{"--ssl=false", "--rate-limit=1r/s; deny all", "s.example.com", htmlDir}, d)
+	if code != exitUserError {
+		t.Fatalf("bad --rate-limit: exit=%d, want %d", code, exitUserError)
+	}
+	if !strings.Contains(stderr.String(), "rate-limit:") {
+		t.Errorf("stderr missing rate-limit error: %s", stderr)
+	}
+	if _, err := os.Stat(filepath.Join(d.Layout.SitesAvailable, "s.example.com.conf")); err == nil {
+		t.Error("no config file should be written on a rejected --rate-limit")
+	}
+}
+
+// --rate-limit under --allow=cf is suppressed (the key would be the CF edge IP)
+// and a note is printed; the file carries no directives.
+func TestRunVhostRateLimitSuppressedUnderCF(t *testing.T) {
+	d, _, _, stderr := defaultDepsFor(t)
+	seedCert(t, d.Layout, "p.example.com")
+	if code := Run([]string{"--allow=cf", "--rate-limit=50r/s:100", "p.example.com", "10.0.0.1:8080"}, d); code != exitOK {
+		t.Fatalf("exit=%d stderr=%s", code, stderr)
+	}
+	b, _ := os.ReadFile(filepath.Join(d.Layout.SitesAvailable, "p.example.com.conf"))
+	s := string(b)
+	if strings.Contains(s, "limit_req_zone") || strings.Contains(s, "limit_conn") {
+		t.Errorf("CF vhost must not emit rate-limit directives:\n%s", s)
+	}
+	if !strings.Contains(s, "ratelimit=off") {
+		t.Errorf("marker must record ratelimit=off under CF:\n%s", s)
+	}
+	if !strings.Contains(stderr.String(), "ignored with --allow=cf") {
+		t.Errorf("stderr missing CF-suppression note: %s", stderr)
 	}
 }
 

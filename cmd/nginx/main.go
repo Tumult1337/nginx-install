@@ -133,6 +133,8 @@ func Run(args []string, d Deps) int {
 	force := fs.Bool("force", false, "overwrite files lacking the managed marker")
 	certDir := fs.String("cert-dir", "", "override cert lookup base (default: $NGINX_CERT_DIR or /etc/letsencrypt/live)")
 	brotli := fs.String("brotli", "auto", "auto: try to install brotli, fall back if unavailable | on: require brotli (error if unavailable) | off: render without brotli, skip apt entirely")
+	var rateLimit rateLimitFlag
+	fs.Var(&rateLimit, "rate-limit", "opt-in per-vhost rate limiting. Bare: 50r/s, burst 100. Or <rate>:<burst> e.g. 50r/s:100 (rate is <n>r/s|<n>r/m). Off by default; ignored with --allow=cf.")
 
 	if err := fs.Parse(args); err != nil {
 		return exitUserError
@@ -247,16 +249,49 @@ func Run(args []string, d Deps) int {
 		ProxySSLVerify: *proxySSLVerify,
 		AllowSpec:      *allowFlag,
 		HSTSSpec:       *hstsFlag,
+		RateLimitSpec:  rateLimit.spec(),
 		Force:          *force,
 		DryRun:         *dryRun,
 		NoReload:       *noReload,
 	})
 }
 
+// rateLimitFlag lets --rate-limit act both as a bare bool flag (defaults) and
+// as --rate-limit=<rate>:<burst>. Implementing IsBoolFlag makes the bare form
+// call Set("true"); the "=value" form passes the value through. Absent leaves
+// set=false, which spec() reports as "" (disabled).
+type rateLimitFlag struct {
+	set bool
+	val string
+}
+
+func (f *rateLimitFlag) String() string   { return f.val }
+func (f *rateLimitFlag) IsBoolFlag() bool { return true }
+
+// Set honors the bool-flag convention IsBoolFlag opts into: a parseable boolean
+// enables ("true", bare flag) or disables ("false") the same as a real bool
+// flag. Any other value is a rate spec passed through to ParseRateLimit.
+func (f *rateLimitFlag) Set(s string) error {
+	if b, err := strconv.ParseBool(s); err == nil {
+		f.set, f.val = b, "true"
+		return nil
+	}
+	f.set, f.val = true, s
+	return nil
+}
+
+func (f *rateLimitFlag) spec() string {
+	if !f.set {
+		return ""
+	}
+	return f.val
+}
+
 func printUsage(w io.Writer) {
 	fmt.Fprintln(w, "Usage:")
-	fmt.Fprintln(w, "  nginx-gen [--ssl=true|false] [--allow=cf|cidrs] [--hsts=off|on|subdomains|preload] [--cert-dir=DIR] [--force] [--dry-run] [--no-reload] <host> <target>")
-	fmt.Fprintln(w, "    hsts     = off (default) | on (this host) | subdomains | preload")
+	fmt.Fprintln(w, "  nginx-gen [--ssl=true|false] [--allow=cf|cidrs] [--hsts=off|on|subdomains|preload] [--rate-limit[=rate:burst]] [--cert-dir=DIR] [--force] [--dry-run] [--no-reload] <host> <target>")
+	fmt.Fprintln(w, "    hsts       = off (default) | on (this host) | subdomains | preload")
+	fmt.Fprintln(w, "    rate-limit = off (default) | bare (50r/s, burst 100) | rate:burst e.g. 50r/s:100")
 	fmt.Fprintln(w, "    target   = ip[:port] | host[:port]   (proxy mode)")
 	fmt.Fprintln(w, "             = /absolute/path/to/htmldir (static mode, must exist)")
 	fmt.Fprintln(w, "    cert-dir = lookup base for <host>/fullchain.pem (default: $NGINX_CERT_DIR or /etc/letsencrypt/live)")
@@ -285,6 +320,7 @@ type vhostOpts struct {
 	Target         string
 	AllowSpec      string
 	HSTSSpec       string
+	RateLimitSpec  string
 	SSL            bool
 	ProxySSLVerify bool
 	Force          bool
@@ -321,6 +357,17 @@ func runVhost(d Deps, o vhostOpts) int {
 		fmt.Fprintln(d.Stderr, "hsts:", err)
 		return exitUserError
 	}
+
+	rl, err := cli.ParseRateLimit(o.RateLimitSpec)
+	if err != nil {
+		fmt.Fprintln(d.Stderr, "rate-limit:", err)
+		return exitUserError
+	}
+	if rl.Enabled && allowKind == cli.AllowCF {
+		fmt.Fprintln(d.Stderr, "note: --rate-limit ignored with --allow=cf",
+			"(the key would be the Cloudflare edge IP, not the client)")
+		rl.Enabled = false
+	}
 	// Reject rather than silently drop: browsers ignore HSTS received over
 	// plain HTTP (RFC 6797 §8.1), so honoring this combination would hand the
 	// operator a config that looks hardened and is not.
@@ -346,11 +393,15 @@ func runVhost(d Deps, o vhostOpts) int {
 	}
 
 	cfg := render.VhostCfg{
-		Host:        host,
-		SSL:         o.SSL,
-		AllowCIDRs:  allowCIDRs,
-		Now:         d.Now(),
-		HTTP2Inline: vi.HTTP2Inline(),
+		Host:           host,
+		SSL:            o.SSL,
+		AllowCIDRs:     allowCIDRs,
+		Now:            d.Now(),
+		HTTP2Inline:    vi.HTTP2Inline(),
+		RateLimit:      rl.Enabled,
+		RateLimitRate:  rl.Rate,
+		RateLimitBurst: rl.Burst,
+		RateLimitConn:  rl.Conn,
 	}
 	switch tk {
 	case cli.TargetProxy:
@@ -677,8 +728,8 @@ func runList(d Deps) int {
 		return exitSystemErr
 	}
 	type row struct {
-		host, mode, allow, hsts, ts, enabled string
-		ssl                                  bool
+		host, mode, allow, hsts, ratelimit, ts, enabled string
+		ssl                                             bool
 	}
 	var rows []row
 	for _, e := range entries {
@@ -701,15 +752,21 @@ func runList(d Deps) int {
 		if hsts == "" {
 			hsts = "?"
 		}
+		// Same for ratelimit: a file predating the flag still carries the old
+		// unconditional limit, so "?" (not "off") flags it for a re-render.
+		rl := h.RateLimit
+		if rl == "" {
+			rl = "?"
+		}
 		rows = append(rows, row{
 			host: h.Host, mode: h.Mode, ssl: h.SSL, allow: h.Allow, hsts: hsts,
-			ts: h.TS.Format(time.RFC3339), enabled: enabled,
+			ratelimit: rl, ts: h.TS.Format(time.RFC3339), enabled: enabled,
 		})
 	}
 	slices.SortFunc(rows, func(a, b row) int { return cmp.Compare(a.host, b.host) })
 	for _, r := range rows {
-		fmt.Fprintf(d.Stdout, "%-40s mode=%-6s ssl=%-5t allow=%-10s hsts=%-10s enabled=%s ts=%s\n",
-			r.host, r.mode, r.ssl, r.allow, r.hsts, r.enabled, r.ts)
+		fmt.Fprintf(d.Stdout, "%-40s mode=%-6s ssl=%-5t allow=%-10s hsts=%-10s ratelimit=%-12s enabled=%s ts=%s\n",
+			r.host, r.mode, r.ssl, r.allow, r.hsts, r.ratelimit, r.enabled, r.ts)
 	}
 	return exitOK
 }

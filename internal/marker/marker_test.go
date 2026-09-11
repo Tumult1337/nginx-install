@@ -133,3 +133,37 @@ func TestParsePreHSTSMarker(t *testing.T) {
 		t.Errorf("other fields corrupted: %+v", h)
 	}
 }
+
+func TestParseRateLimitField(t *testing.T) {
+	now := time.Date(2026, 5, 3, 12, 0, 0, 0, time.UTC)
+	for _, want := range []string{"off", "50r/s:100", "10r/m:5"} {
+		rendered := RenderVhost(Header{
+			Host: "example.com", Mode: "proxy", SSL: true, Allow: "none", HSTS: "off", RateLimit: want, TS: now,
+		})
+		h, ok := Parse([]byte(rendered))
+		if !ok {
+			t.Fatalf("ratelimit=%s: Parse returned ok=false", want)
+		}
+		if h.RateLimit != want {
+			t.Errorf("RateLimit = %q, want %q", h.RateLimit, want)
+		}
+	}
+}
+
+// A marker written before --rate-limit existed has no ratelimit= field. It must
+// parse with RateLimit empty, so --list shows "?" (not "off") for a file that
+// still carries the old unconditional limit until it is re-rendered.
+func TestParsePreRateLimitMarker(t *testing.T) {
+	legacy := FirstLine + "\n" +
+		"# kind=vhost host=example.com mode=proxy ssl=true allow=cf hsts=on ts=2026-05-03T12:00:00Z\n"
+	h, ok := Parse([]byte(legacy))
+	if !ok {
+		t.Fatal("Parse returned ok=false for pre-ratelimit marker")
+	}
+	if h.RateLimit != "" {
+		t.Errorf("RateLimit = %q, want empty for a marker with no ratelimit= field", h.RateLimit)
+	}
+	if h.HSTS != "on" || h.Host != "example.com" {
+		t.Errorf("other fields corrupted: %+v", h)
+	}
+}
