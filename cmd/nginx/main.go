@@ -118,10 +118,11 @@ func Run(args []string, d Deps) int {
 	doBrotliBuild := fs.Bool("brotli-build", false, "compile ngx_brotli dynamic modules against the installed nginx (for hosts where the Debian brotli packages are ABI-incompatible)")
 	doInstall := fs.Bool("install", false, "bootstrap a fresh nginx install: add nginx.org repo, apt-get install nginx, render managed nginx.conf, optionally build brotli")
 	doBootstrap := fs.Bool("bootstrap", false, "first-time host setup: --install + --sysctl in one shot (idempotent, safe to rerun)")
-	doNginxUpgrade := fs.Bool("nginx-upgrade", false, "apt-upgrade the nginx package, rebuild brotli if version drifted, re-render nginx.conf, restart. (Does NOT touch the nginx-gen tool — use --self-update for that.)")
+	doUpgrade := fs.Bool("upgrade", false, "apt-upgrade the nginx package, rebuild brotli if version drifted, re-render nginx.conf, restart. (Does NOT touch the nginx-gen tool — use --self-update for that.)")
 	doABICheck := fs.Bool("abi-check", false, "print nginx + brotli ABI sync status; exit 1 on drift (suitable for cron/nagios)")
 	doConvert := fs.Bool("convert", false, "best-effort migration of an existing (Debian/other) nginx install into nginx-gen's managed setup; snapshots /etc/nginx + writes a rollback script before touching anything")
-	doSelfUpdate := fs.Bool("self-update", false, "replace this nginx-gen binary with the latest GitHub release (verified by sha256). Does NOT touch nginx itself — use --nginx-upgrade for that.")
+	doSelfUpdate := fs.Bool("self-update", false, "replace this nginx-gen binary with the latest GitHub release (verified by sha256). Does NOT touch nginx itself — use --upgrade for that.")
+	doDomains := fs.Bool("domains", false, "list managed domains and their backends: proxy → host:port, static → root dir")
 	doVersion := fs.Bool("version", false, "print nginx-gen tool version and exit")
 	channel := fs.String("channel", "mainline", "nginx.org channel: mainline | stable (only used with --install / --bootstrap)")
 	useSSL := fs.Bool("ssl", true, "enable SSL listener (HTTP→HTTPS redirect + 443)")
@@ -149,6 +150,12 @@ func Run(args []string, d Deps) int {
 	switch {
 	case *doList:
 		return runList(d)
+	case *doDomains:
+		if len(pos) != 0 {
+			fmt.Fprintln(d.Stderr, "usage: nginx-gen --domains  (no positional args)")
+			return exitUserError
+		}
+		return runDomains(d)
 	case *doRemove:
 		if len(pos) != 1 {
 			fmt.Fprintln(d.Stderr, "usage: nginx-gen --remove <host>")
@@ -200,9 +207,9 @@ func Run(args []string, d Deps) int {
 			return exitUserError
 		}
 		return runBootstrap(d, *channel, mode, *dryRun, *force, *noReload)
-	case *doNginxUpgrade:
+	case *doUpgrade:
 		if len(pos) != 0 {
-			fmt.Fprintln(d.Stderr, "usage: nginx-gen --nginx-upgrade  (no positional args)")
+			fmt.Fprintln(d.Stderr, "usage: nginx-gen --upgrade  (no positional args)")
 			return exitUserError
 		}
 		return runNginxUpgrade(d, *dryRun, *force, *noReload)
@@ -298,11 +305,12 @@ func printUsage(w io.Writer) {
 	fmt.Fprintln(w, "  nginx-gen --main [--brotli=auto|on|off] [--force] [--dry-run] [--no-reload]")
 	fmt.Fprintln(w, "  nginx-gen --remove <host>")
 	fmt.Fprintln(w, "  nginx-gen --list")
+	fmt.Fprintln(w, "  nginx-gen --domains        (print domain -> backend for managed vhosts)")
 	fmt.Fprintln(w, "  nginx-gen --sysctl  [--force] [--dry-run] [--no-reload]")
 	fmt.Fprintln(w, "  nginx-gen --brotli-build  [--force] [--dry-run]")
 	fmt.Fprintln(w, "  nginx-gen --install    [--channel=mainline|stable] [--brotli=auto|on|off] [--force] [--dry-run]")
 	fmt.Fprintln(w, "  nginx-gen --bootstrap  [--channel=mainline|stable] [--brotli=auto|on|off] [--force] [--dry-run] [--no-reload]")
-	fmt.Fprintln(w, "  nginx-gen --nginx-upgrade  [--force] [--dry-run] [--no-reload]")
+	fmt.Fprintln(w, "  nginx-gen --upgrade        [--force] [--dry-run] [--no-reload]")
 	fmt.Fprintln(w, "  nginx-gen --abi-check       (exit 0 if nginx+brotli ABIs match; 1 on drift)")
 	fmt.Fprintln(w, "  nginx-gen --convert    [--channel=mainline|stable] [--brotli=auto|on|off] [--dry-run] [--no-reload]")
 	fmt.Fprintln(w, "  nginx-gen --self-update  [--force] [--dry-run]")
@@ -771,6 +779,63 @@ func runList(d Deps) int {
 	return exitOK
 }
 
+// backendRe and rootRe mirror the server/root directives in render's
+// proxy.tmpl and static.tmpl.
+var (
+	backendRe = regexp.MustCompile(`(?m)^\s*server\s+(\S+)\s+max_fails=`)
+	rootRe    = regexp.MustCompile(`(?m)^\s*root\s+(\S+);`)
+)
+
+// vhostBackend returns the host:port (proxy) or root dir (static) the vhost
+// forwards to, or "?" when the body does not match the templates.
+func vhostBackend(mode string, body []byte) string {
+	var re *regexp.Regexp
+	switch mode {
+	case "proxy":
+		re = backendRe
+	case "static":
+		re = rootRe
+	default:
+		return "?"
+	}
+	if m := re.FindSubmatch(body); m != nil {
+		return string(m[1])
+	}
+	return "?"
+}
+
+func runDomains(d Deps) int {
+	entries, err := os.ReadDir(d.Layout.SitesAvailable)
+	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return exitOK // empty
+		}
+		fmt.Fprintln(d.Stderr, "domains:", err)
+		return exitSystemErr
+	}
+	type row struct{ host, backend string }
+	var rows []row
+	for _, e := range entries {
+		if e.IsDir() || !strings.HasSuffix(e.Name(), ".conf") {
+			continue
+		}
+		body, err := os.ReadFile(filepath.Join(d.Layout.SitesAvailable, e.Name()))
+		if err != nil {
+			continue
+		}
+		h, ok := marker.Parse(body)
+		if !ok || h.Kind != marker.KindVhost {
+			continue
+		}
+		rows = append(rows, row{host: h.Host, backend: vhostBackend(h.Mode, body)})
+	}
+	slices.SortFunc(rows, func(a, b row) int { return cmp.Compare(a.host, b.host) })
+	for _, r := range rows {
+		fmt.Fprintf(d.Stdout, "%-40s -> %s\n", r.host, r.backend)
+	}
+	return exitOK
+}
+
 // ---- sysctl ----
 
 const sysctlManagedPrefix = "# Managed by nginx-gen\n"
@@ -1131,7 +1196,7 @@ func runNginxUpgrade(d Deps, dryRun, force, noReload bool) int {
 		return exitOK
 	}
 	if os.Geteuid() != 0 {
-		fmt.Fprintln(d.Stderr, "--nginx-upgrade requires root (apt-get + writes to /etc)")
+		fmt.Fprintln(d.Stderr, "--upgrade requires root (apt-get + writes to /etc)")
 		return exitUserError
 	}
 
@@ -1261,7 +1326,7 @@ func runABICheck(d Deps) int {
 		return exitOK
 	}
 	fmt.Fprintf(d.Stdout,
-		"brotli built against: %s  DRIFT — nginx is %s. Run `nginx-gen --nginx-upgrade` (or `--brotli-build --force`).\n",
+		"brotli built against: %s  DRIFT — nginx is %s. Run `nginx-gen --upgrade` (or `--brotli-build --force`).\n",
 		builtVer, nginxVer)
 	return exitUserError
 }
@@ -1314,7 +1379,7 @@ func runConvert(d Deps, channelStr string, brotliMode BrotliMode, dryRun, noRelo
 	if data, err := os.ReadFile(d.Layout.MainConfPath); err == nil {
 		if bytes.HasPrefix(data, []byte(marker.FirstLine)) {
 			fmt.Fprintln(d.Stderr, "nginx.conf already managed by nginx-gen — nothing to convert.")
-			fmt.Fprintln(d.Stderr, "       use --nginx-upgrade to refresh, or --main to re-render.")
+			fmt.Fprintln(d.Stderr, "       use --upgrade to refresh, or --main to re-render.")
 			return exitOK
 		}
 	}
@@ -2053,7 +2118,7 @@ func neutralizeLegacy(path string, stderr io.Writer) {
 // stdin is closed — which is exactly how --convert fails on a host with
 // a hand-edited nginx.conf.
 //
-// For --install/--convert/--nginx-upgrade specifically, what dpkg leaves
+// For --install/--convert/--upgrade specifically, what dpkg leaves
 // behind is overwritten by runMain immediately after, so confold vs
 // confnew doesn't affect the final state — we just need to skip the
 // prompt.

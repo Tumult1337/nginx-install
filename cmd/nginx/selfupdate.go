@@ -1,4 +1,4 @@
-// Self-update for the nginx-gen binary itself (distinct from --nginx-upgrade,
+// Self-update for the nginx-gen binary itself (distinct from --upgrade,
 // which upgrades the *nginx* package). Fetches the latest release asset
 // from GitHub for the current GOOS/GOARCH, verifies its sha256 against
 // the release's checksums.txt, and atomically replaces the running binary.

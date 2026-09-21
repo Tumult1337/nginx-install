@@ -524,6 +524,51 @@ func TestRunListAfterDeploys(t *testing.T) {
 	}
 }
 
+// ---- --domains ----
+
+func TestRunDomainsProxyAndStatic(t *testing.T) {
+	d, _, stdout, stderr := defaultDepsFor(t)
+	htmlDir := t.TempDir()
+
+	if code := Run([]string{"--ssl=false", "api.example.com", "10.0.0.1:8080"}, d); code != exitOK {
+		t.Fatalf("proxy deploy failed: stderr=%s", stderr)
+	}
+	if code := Run([]string{"--ssl=false", "static.example.com", htmlDir}, d); code != exitOK {
+		t.Fatalf("static deploy failed: stderr=%s", stderr)
+	}
+
+	stdout.Reset()
+	if code := Run([]string{"--domains"}, d); code != exitOK {
+		t.Fatalf("domains failed: stderr=%s", stderr)
+	}
+	out := stdout.String()
+	collapsed := strings.Join(strings.Fields(out), " ")
+	for _, want := range []string{
+		"api.example.com -> 10.0.0.1:8080",
+		"static.example.com -> " + htmlDir,
+	} {
+		if !strings.Contains(collapsed, want) {
+			t.Errorf("domains missing %q:\n%s", want, out)
+		}
+	}
+}
+
+func TestRunDomainsRejectsPositionalArg(t *testing.T) {
+	d, _, _, _ := defaultDepsFor(t)
+	if code := Run([]string{"--domains", "extra"}, d); code != exitUserError {
+		t.Errorf("want exitUserError for positional arg, got %d", code)
+	}
+}
+
+func TestVhostBackendUnmatched(t *testing.T) {
+	if got := vhostBackend("proxy", []byte("no upstream here")); got != "?" {
+		t.Errorf("unmatched proxy body: want ?, got %q", got)
+	}
+	if got := vhostBackend("bogus", []byte("root /var/www/x;")); got != "?" {
+		t.Errorf("unknown mode: want ?, got %q", got)
+	}
+}
+
 // ---- --brotli ----
 
 func TestParseBrotliMode(t *testing.T) {
@@ -938,11 +983,11 @@ func TestWriteRollbackScriptUnknownVersion(t *testing.T) {
 	}
 }
 
-// ---- --nginx-upgrade / --abi-check ----
+// ---- --upgrade / --abi-check ----
 
 func TestRunUpgradeDryRunPrintsRecipe(t *testing.T) {
 	d, exec, stdout, stderr := defaultDepsFor(t)
-	if code := Run([]string{"--nginx-upgrade", "--dry-run"}, d); code != exitOK {
+	if code := Run([]string{"--upgrade", "--dry-run"}, d); code != exitOK {
 		t.Fatalf("exit=%d stderr=%s", code, stderr)
 	}
 	for _, want := range []string{
