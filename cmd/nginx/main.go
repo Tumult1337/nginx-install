@@ -110,6 +110,7 @@ const (
 func Run(args []string, d Deps) int {
 	fs := flag.NewFlagSet("nginx-gen", flag.ContinueOnError)
 	fs.SetOutput(d.Stderr)
+	fs.Usage = func() { printUsage(d.Stderr) }
 
 	useMain := fs.Bool("main", false, "write the global /etc/nginx/nginx.conf")
 	doRemove := fs.Bool("remove", false, "remove a managed vhost: --remove <host>")
