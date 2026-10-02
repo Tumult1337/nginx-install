@@ -22,10 +22,10 @@ func mustPrefix(t *testing.T, s string) netip.Prefix {
 // Render must always start with the marker.
 func TestVhostHasMarker(t *testing.T) {
 	cfg := VhostCfg{
-		Host:         "a.example.com",
-		Mode:         ModeProxy,
-		SSL:          true,
-		CertDir:      "/etc/letsencrypt/live/example.com",
+		Host:     "a.example.com",
+		Mode:     ModeProxy,
+		SSL:      true,
+		CertFile: "/etc/letsencrypt/live/example.com/fullchain.pem", KeyFile: "/etc/letsencrypt/live/example.com/privkey.pem",
 		Allow:        AllowNone,
 		Upstream:     "10.0.0.1:8080",
 		UpstreamName: "a_example_com_up",
@@ -45,10 +45,10 @@ func TestVhostHasMarker(t *testing.T) {
 
 func TestProxySSLWithCF(t *testing.T) {
 	cfg := VhostCfg{
-		Host:         "p.example.com",
-		Mode:         ModeProxy,
-		SSL:          true,
-		CertDir:      "/etc/letsencrypt/live/example.com",
+		Host:     "p.example.com",
+		Mode:     ModeProxy,
+		SSL:      true,
+		CertFile: "/etc/letsencrypt/live/example.com/fullchain.pem", KeyFile: "/etc/letsencrypt/live/example.com/privkey.pem",
 		Allow:        AllowCF,
 		HSTS:         HSTSOn,
 		Upstream:     "10.0.0.1:8080",
@@ -78,10 +78,10 @@ func TestProxySSLWithCF(t *testing.T) {
 
 func TestProxyLocationHeaders(t *testing.T) {
 	cfg := VhostCfg{
-		Host:         "p.example.com",
-		Mode:         ModeProxy,
-		SSL:          true,
-		CertDir:      "/etc/letsencrypt/live/example.com",
+		Host:     "p.example.com",
+		Mode:     ModeProxy,
+		SSL:      true,
+		CertFile: "/etc/letsencrypt/live/example.com/fullchain.pem", KeyFile: "/etc/letsencrypt/live/example.com/privkey.pem",
 		Allow:        AllowNone,
 		Upstream:     "10.0.0.1:8080",
 		UpstreamName: "p_example_com_up",
@@ -106,10 +106,10 @@ func TestProxyLocationHeaders(t *testing.T) {
 
 func TestProxyHTTPSUpstream(t *testing.T) {
 	cfg := VhostCfg{
-		Host:         "manager.skybyte.cloud",
-		Mode:         ModeProxy,
-		SSL:          true,
-		CertDir:      "/etc/letsencrypt/live/skybyte.cloud",
+		Host:     "manager.skybyte.cloud",
+		Mode:     ModeProxy,
+		SSL:      true,
+		CertFile: "/etc/letsencrypt/live/skybyte.cloud/fullchain.pem", KeyFile: "/etc/letsencrypt/live/skybyte.cloud/privkey.pem",
 		Allow:        AllowNone,
 		Upstream:     "5.231.234.5:8443",
 		UpstreamName: "manager_skybyte_cloud_up",
@@ -132,10 +132,10 @@ func TestProxyHTTPSUpstream(t *testing.T) {
 
 func TestProxyHTTPSUpstreamVerify(t *testing.T) {
 	cfg := VhostCfg{
-		Host:           "manager.skybyte.cloud",
-		Mode:           ModeProxy,
-		SSL:            true,
-		CertDir:        "/etc/letsencrypt/live/skybyte.cloud",
+		Host:     "manager.skybyte.cloud",
+		Mode:     ModeProxy,
+		SSL:      true,
+		CertFile: "/etc/letsencrypt/live/skybyte.cloud/fullchain.pem", KeyFile: "/etc/letsencrypt/live/skybyte.cloud/privkey.pem",
 		Allow:          AllowNone,
 		Upstream:       "backend.internal:8443",
 		UpstreamName:   "manager_skybyte_cloud_up",
@@ -157,10 +157,10 @@ func TestProxyHTTPSUpstreamVerify(t *testing.T) {
 
 func TestStaplingNotDisabledWithoutCF(t *testing.T) {
 	cfg := VhostCfg{
-		Host:         "p.example.com",
-		Mode:         ModeProxy,
-		SSL:          true,
-		CertDir:      "/etc/letsencrypt/live/example.com",
+		Host:     "p.example.com",
+		Mode:     ModeProxy,
+		SSL:      true,
+		CertFile: "/etc/letsencrypt/live/example.com/fullchain.pem", KeyFile: "/etc/letsencrypt/live/example.com/privkey.pem",
 		Allow:        AllowNone,
 		Upstream:     "10.0.0.1:8080",
 		UpstreamName: "p_example_com_up",
@@ -347,10 +347,10 @@ func TestVhostRateLimitOptOut(t *testing.T) {
 // the key would be the Cloudflare edge IP. The marker records "off" to match.
 func TestVhostRateLimitSuppressedUnderCF(t *testing.T) {
 	cfg := VhostCfg{
-		Host:           "d.example.com",
-		Mode:           ModeProxy,
-		SSL:            true,
-		CertDir:        "/etc/letsencrypt/live/example.com",
+		Host:     "d.example.com",
+		Mode:     ModeProxy,
+		SSL:      true,
+		CertFile: "/etc/letsencrypt/live/example.com/fullchain.pem", KeyFile: "/etc/letsencrypt/live/example.com/privkey.pem",
 		Allow:          AllowCF,
 		Upstream:       "10.0.0.1:8080",
 		UpstreamName:   "d_example_com_up",
@@ -469,7 +469,7 @@ func TestHSTSOffEmitsNoHeader(t *testing.T) {
 	for _, mode := range []Mode{ModeProxy, ModeStatic} {
 		cfg := VhostCfg{
 			Host: "h.example.com", Mode: mode, SSL: true, HSTS: HSTSOff,
-			CertDir:  "/etc/letsencrypt/live/example.com",
+			CertFile: "/etc/letsencrypt/live/example.com/fullchain.pem", KeyFile: "/etc/letsencrypt/live/example.com/privkey.pem",
 			Upstream: "10.0.0.1:8080", UpstreamName: "h_up",
 			Root: "/var/www/h", Now: fixedTime,
 		}
@@ -488,8 +488,8 @@ func TestHSTSOffEmitsNoHeader(t *testing.T) {
 func TestStaticAssetLocationRestatesHSTS(t *testing.T) {
 	cfg := VhostCfg{
 		Host: "s.example.com", Mode: ModeStatic, SSL: true, HSTS: HSTSSubdomains,
-		CertDir: "/etc/letsencrypt/live/example.com",
-		Root:    "/var/www/s", Now: fixedTime,
+		CertFile: "/etc/letsencrypt/live/example.com/fullchain.pem", KeyFile: "/etc/letsencrypt/live/example.com/privkey.pem",
+		Root: "/var/www/s", Now: fixedTime,
 	}
 	out, err := Vhost(cfg)
 	if err != nil {
@@ -517,8 +517,8 @@ func TestStaticAssetLocationRestatesHSTS(t *testing.T) {
 func TestStaticAssetLocationNoHSTSWhenOff(t *testing.T) {
 	cfg := VhostCfg{
 		Host: "s.example.com", Mode: ModeStatic, SSL: true, HSTS: HSTSOff,
-		CertDir: "/etc/letsencrypt/live/example.com",
-		Root:    "/var/www/s", Now: fixedTime,
+		CertFile: "/etc/letsencrypt/live/example.com/fullchain.pem", KeyFile: "/etc/letsencrypt/live/example.com/privkey.pem",
+		Root: "/var/www/s", Now: fixedTime,
 	}
 	out, err := Vhost(cfg)
 	if err != nil {
@@ -540,11 +540,118 @@ func TestHSTSRecordedInMarker(t *testing.T) {
 	} {
 		out, err := Vhost(VhostCfg{
 			Host: "m.example.com", Mode: ModeStatic, SSL: true, HSTS: c.h,
-			CertDir: "/etc/letsencrypt/live/example.com", Root: "/var/www/m", Now: fixedTime,
+			CertFile: "/etc/letsencrypt/live/example.com/fullchain.pem", KeyFile: "/etc/letsencrypt/live/example.com/privkey.pem", Root: "/var/www/m", Now: fixedTime,
 		})
 		if err != nil {
 			t.Fatal(err)
 		}
 		mustContain(t, firstLines(out, 2), c.want)
+	}
+}
+
+func redirectServer(t *testing.T, out []byte) string {
+	t.Helper()
+	s := string(out)
+	start := strings.Index(s, "server {\n    listen 80;")
+	if start < 0 {
+		t.Fatalf("no :80 redirect server in output:\n%s", s)
+	}
+	end := strings.Index(s[start:], "\n}\n")
+	if end < 0 {
+		t.Fatalf("unterminated :80 redirect server:\n%s", s[start:])
+	}
+	return s[start : start+end+2]
+}
+
+func TestRedirectServerEnforcesACLBeforeRedirect(t *testing.T) {
+	cases := []struct {
+		name  string
+		allow AllowSpec
+		cidrs []netip.Prefix
+		acl   []string
+	}{
+		{"cf", AllowCF, nil, []string{"include /etc/nginx/snippets/cf-allow.conf;"}},
+		{"list", AllowList, []netip.Prefix{mustPrefix(t, "10.0.0.0/8"), mustPrefix(t, "1.2.3.4/32")},
+			[]string{"allow 10.0.0.0/8;", "allow 1.2.3.4/32;", "deny all;"}},
+	}
+	for _, c := range cases {
+		for _, mode := range []Mode{ModeProxy, ModeStatic} {
+			out, err := Vhost(VhostCfg{
+				Host: "r.example.com", Mode: mode, SSL: true,
+				CertFile: "/etc/letsencrypt/live/example.com/fullchain.pem", KeyFile: "/etc/letsencrypt/live/example.com/privkey.pem",
+				Allow: c.allow, AllowCIDRs: c.cidrs,
+				Upstream: "10.0.0.1:8080", UpstreamName: "r_up", Root: "/var/www/r",
+				Now: fixedTime,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			srv := redirectServer(t, out)
+			for _, want := range c.acl {
+				mustContain(t, srv, want)
+			}
+			mustContain(t, srv, "    location / {\n        try_files \"\" @https;\n    }")
+			mustContain(t, srv, "    location @https {\n        return 301 https://$host$request_uri;\n    }")
+			if strings.Count(srv, "return 301") != 1 {
+				t.Errorf("%s/%s: redirect must exist only inside location @https:\n%s", c.name, mode, srv)
+			}
+		}
+	}
+}
+
+func TestRedirectServerNoACLWithoutAllow(t *testing.T) {
+	out, err := Vhost(VhostCfg{
+		Host: "n.example.com", Mode: ModeStatic, SSL: true,
+		CertFile: "/etc/letsencrypt/live/example.com/fullchain.pem", KeyFile: "/etc/letsencrypt/live/example.com/privkey.pem", Root: "/var/www/n", Now: fixedTime,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := redirectServer(t, out)
+	mustNotContain(t, srv, "deny all;")
+	mustNotContain(t, srv, "cf-allow.conf")
+	mustContain(t, srv, "return 301 https://$host$request_uri;")
+}
+
+func TestMainCatchAllServer(t *testing.T) {
+	out, err := Main(MainCfg{Now: fixedTime, RejectHandshake: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := string(out)
+	mustContain(t, s, "        listen 80 default_server;\n        listen [::]:80 default_server;\n"+
+		"        # Rejects a TLS handshake with no SNI or an unknown SNI, so no certificate is sent.\n"+
+		"        listen 443 ssl default_server;\n        listen [::]:443 ssl default_server;\n"+
+		"        ssl_reject_handshake on;\n        server_name _;\n        access_log  off;\n        return      444;\n")
+	if strings.Index(s, "default_server") > strings.Index(s, "include /etc/nginx/sites-enabled/*.conf;") {
+		t.Errorf("catch-all must be inside http {} before the vhost include")
+	}
+}
+
+func TestMainCatchAllWithoutRejectHandshake(t *testing.T) {
+	out, err := Main(MainCfg{Now: fixedTime})
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := string(out)
+	mustContain(t, s, "        listen 80 default_server;\n        listen [::]:80 default_server;\n        server_name _;")
+	mustNotContain(t, s, "443")
+	mustNotContain(t, s, "ssl_reject_handshake")
+}
+
+func TestVhostUsesResolvedCertFiles(t *testing.T) {
+	for _, mode := range []Mode{ModeProxy, ModeStatic} {
+		out, err := Vhost(VhostCfg{
+			Host: "c.example.com", Mode: mode, SSL: true,
+			CertFile: "/etc/nginx/ssl/example.com/example.com.crt",
+			KeyFile:  "/etc/nginx/ssl/example.com/example.com.key",
+			Upstream: "10.0.0.1:8080", UpstreamName: "c_up", Root: "/var/www/c", Now: fixedTime,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		s := string(out)
+		mustContain(t, s, "    ssl_certificate     /etc/nginx/ssl/example.com/example.com.crt;\n")
+		mustContain(t, s, "    ssl_certificate_key /etc/nginx/ssl/example.com/example.com.key;\n")
 	}
 }

@@ -79,6 +79,19 @@ func (v VersionInfo) HTTP2Inline() bool {
 	}
 }
 
+// SupportsRejectHandshake reports whether this nginx version has the
+// ssl_reject_handshake directive, introduced in nginx 1.19.4.
+func (v VersionInfo) SupportsRejectHandshake() bool {
+	switch {
+	case v.Major != 1:
+		return v.Major > 1
+	case v.Minor != 19:
+		return v.Minor > 19
+	default:
+		return v.Patch >= 4
+	}
+}
+
 var versionRE = regexp.MustCompile(`nginx/(\d+)\.(\d+)\.(\d+)`)
 
 // Version runs `nginx -v` and returns the parsed version.

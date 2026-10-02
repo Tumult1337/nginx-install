@@ -31,7 +31,7 @@ func tempLayout(t *testing.T) Layout {
 		LockPath:           filepath.Join(dir, "lock"),
 		SnippetPath:        filepath.Join(dir, "snippets/cf-allow.conf"),
 		CachePath:          filepath.Join(dir, "lib/cf-allow.conf"),
-		CertDir:            filepath.Join(dir, "letsencrypt"),
+		CertDirs:           []string{filepath.Join(dir, "letsencrypt"), filepath.Join(dir, "nginx-ssl")},
 		SysctlPath:         filepath.Join(dir, "sysctl.d/99-nginx.conf"),
 		SystemdOverrideDir: filepath.Join(dir, "systemd/nginx.service.d"),
 		ModulesDir:         filepath.Join(dir, "modules"),
@@ -118,7 +118,7 @@ func overrideNginxOrgSourcesList(t *testing.T, path string) {
 
 func seedCert(t *testing.T, layout Layout, host string) {
 	t.Helper()
-	dir := filepath.Join(layout.CertDir, host)
+	dir := filepath.Join(layout.CertDirs[0], host)
 	if err := os.MkdirAll(dir, 0755); err != nil {
 		t.Fatal(err)
 	}
@@ -1488,5 +1488,91 @@ func TestListShowsHSTS(t *testing.T) {
 	}
 	if !strings.Contains(stdout.String(), "hsts=subdomains") {
 		t.Errorf("--list missing hsts column: %s", stdout)
+	}
+}
+
+func TestRunMainCatchAllByNginxVersion(t *testing.T) {
+	cases := []struct {
+		name    string
+		version func() (nginx.VersionInfo, error)
+		reject  bool
+		warn    bool
+	}{
+		{"old", func() (nginx.VersionInfo, error) { return nginx.VersionInfo{Major: 1, Minor: 18}, nil }, false, true},
+		{"new", func() (nginx.VersionInfo, error) { return nginx.VersionInfo{Major: 1, Minor: 30, Patch: 5}, nil }, true, false},
+		{"unknown", func() (nginx.VersionInfo, error) { return nginx.VersionInfo{}, errors.New("no nginx") }, true, false},
+	}
+	for _, c := range cases {
+		d, _, _, stderr := defaultDepsFor(t)
+		d.NginxVersion = c.version
+		if code := Run([]string{"--main"}, d); code != exitOK {
+			t.Fatalf("%s: exit=%d stderr=%s", c.name, code, stderr)
+		}
+		b, err := os.ReadFile(d.Layout.MainConfPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !bytes.Contains(b, []byte("listen 80 default_server;")) {
+			t.Errorf("%s: :80 catch-all missing", c.name)
+		}
+		if got := bytes.Contains(b, []byte("ssl_reject_handshake on;")); got != c.reject {
+			t.Errorf("%s: ssl_reject_handshake present=%v, want %v", c.name, got, c.reject)
+		}
+		if got := strings.Contains(stderr.String(), "has no ssl_reject_handshake"); got != c.warn {
+			t.Errorf("%s: warning present=%v, want %v; stderr=%s", c.name, got, c.warn, stderr)
+		}
+	}
+}
+
+func TestRunVhostCertFromSecondBase(t *testing.T) {
+	d, _, _, stderr := defaultDepsFor(t)
+	dir := filepath.Join(d.Layout.CertDirs[1], "example.com")
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	for _, f := range []string{"example.com.crt", "example.com.key"} {
+		if err := os.WriteFile(filepath.Join(dir, f), []byte("x"), 0644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if code := Run([]string{"c.example.com", "10.0.0.1:8080"}, d); code != exitOK {
+		t.Fatalf("exit=%d stderr=%s", code, stderr)
+	}
+	b, err := os.ReadFile(filepath.Join(d.Layout.SitesAvailable, "c.example.com.conf"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{
+		"ssl_certificate     " + filepath.Join(dir, "example.com.crt") + ";",
+		"ssl_certificate_key " + filepath.Join(dir, "example.com.key") + ";",
+	} {
+		if !bytes.Contains(b, []byte(want)) {
+			t.Errorf("vhost missing %q\n%s", want, b)
+		}
+	}
+}
+
+func TestRunCertDirFlagReplacesDefaultBases(t *testing.T) {
+	d, _, _, stderr := defaultDepsFor(t)
+	seedCert(t, d.Layout, "f.example.com")
+	override := t.TempDir()
+	if code := Run([]string{"--cert-dir=" + override, "f.example.com", "10.0.0.1:8080"}, d); code != exitUserError {
+		t.Fatalf("--cert-dir must be the only base: exit=%d stderr=%s", code, stderr)
+	}
+	if !strings.Contains(stderr.String(), override) {
+		t.Errorf("error should name the --cert-dir base: %s", stderr)
+	}
+}
+
+func TestDefaultCertDirs(t *testing.T) {
+	t.Setenv("NGINX_CERT_DIR", "")
+	got := defaultCertDirs()
+	want := []string{"/etc/letsencrypt/live", "/etc/nginx/ssl"}
+	if strings.Join(got, ",") != strings.Join(want, ",") {
+		t.Errorf("default bases = %v, want %v", got, want)
+	}
+	t.Setenv("NGINX_CERT_DIR", "/srv/certs")
+	if got := defaultCertDirs(); len(got) != 1 || got[0] != "/srv/certs" {
+		t.Errorf("$NGINX_CERT_DIR must be the only base, got %v", got)
 	}
 }

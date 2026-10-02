@@ -1,0 +1,30 @@
+{{- define "acl" }}
+{{- if .IsCF }}
+
+    include /etc/nginx/snippets/cf-allow.conf;
+{{- else if .IsList }}
+
+{{- range .AllowCIDRs }}
+    allow {{ . }};
+{{- end }}
+    deny all;
+{{- end }}
+{{- end }}
+
+{{- define "https_redirect" -}}
+server {
+    listen 80;
+    listen [::]:80;
+    server_name {{ .Host }};
+{{- template "acl" . }}
+
+    # A server-level return runs before allow/deny; try_files runs after them.
+    location / {
+        try_files "" @https;
+    }
+
+    location @https {
+        return 301 https://$host$request_uri;
+    }
+}
+{{ end }}

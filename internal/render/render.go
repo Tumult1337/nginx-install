@@ -86,7 +86,8 @@ type VhostCfg struct {
 	Host           string
 	Mode           Mode
 	SSL            bool
-	CertDir        string // resolved (post auto-detect): /etc/letsencrypt/live/<somedomain>
+	CertFile       string // resolved ssl_certificate path, e.g. /etc/letsencrypt/live/<domain>/fullchain.pem
+	KeyFile        string // resolved ssl_certificate_key path
 	Allow          AllowSpec
 	HSTS           HSTS
 	AllowCIDRs     []netip.Prefix // when Allow == AllowList
@@ -204,6 +205,8 @@ func Vhost(cfg VhostCfg) ([]byte, error) {
 type MainCfg struct {
 	Now    time.Time
 	Brotli bool // emit brotli {filter,static} directives (requires the dynamic module)
+
+	RejectHandshake bool // emit the :443 catch-all listener (ssl_reject_handshake needs nginx >= 1.19.4)
 }
 
 // Main renders /etc/nginx/nginx.conf, marker prepended.

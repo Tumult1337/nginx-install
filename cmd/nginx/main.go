@@ -39,7 +39,7 @@ type Layout struct {
 	LockPath           string
 	SnippetPath        string
 	CachePath          string
-	CertDir            string
+	CertDirs           []string
 	SysctlPath         string
 	SystemdOverrideDir string
 	ModulesDir         string // where compiled .so files live (load_module path)
@@ -61,12 +61,21 @@ func DefaultLayout() Layout {
 		LockPath:           get("NGINX_LOCK_PATH", "/run/nginx-gen.lock"),
 		SnippetPath:        get("NGINX_CF_SNIPPET", cf.DefaultSnippet),
 		CachePath:          get("NGINX_CF_CACHE", cf.DefaultCache),
-		CertDir:            get("NGINX_CERT_DIR", "/etc/letsencrypt/live"),
+		CertDirs:           defaultCertDirs(),
 		SysctlPath:         get("NGINX_SYSCTL_PATH", "/etc/sysctl.d/99-nginx.conf"),
 		SystemdOverrideDir: get("NGINX_SYSTEMD_OVERRIDE_DIR", "/etc/systemd/system/nginx.service.d"),
 		ModulesDir:         get("NGINX_MODULES_DIR", "/etc/nginx/modules"),
 		ModulesEnabledDir:  get("NGINX_MODULES_ENABLED_DIR", "/etc/nginx/modules-enabled"),
 	}
+}
+
+// defaultCertDirs returns $NGINX_CERT_DIR alone when set, else the
+// letsencrypt live dir followed by /etc/nginx/ssl.
+func defaultCertDirs() []string {
+	if v := os.Getenv("NGINX_CERT_DIR"); v != "" {
+		return []string{v}
+	}
+	return []string{"/etc/letsencrypt/live", "/etc/nginx/ssl"}
 }
 
 type Deps struct {
@@ -133,7 +142,7 @@ func Run(args []string, d Deps) int {
 	dryRun := fs.Bool("dry-run", false, "print rendered config to stdout, no FS changes")
 	noReload := fs.Bool("no-reload", false, "skip nginx -t and systemctl reload")
 	force := fs.Bool("force", false, "overwrite files lacking the managed marker")
-	certDir := fs.String("cert-dir", "", "override cert lookup base (default: $NGINX_CERT_DIR or /etc/letsencrypt/live)")
+	certDir := fs.String("cert-dir", "", "override cert lookup base (default: $NGINX_CERT_DIR, else /etc/letsencrypt/live then /etc/nginx/ssl)")
 	brotli := fs.String("brotli", "auto", "auto: try to install brotli, fall back if unavailable | on: require brotli (error if unavailable) | off: render without brotli, skip apt entirely")
 	var rateLimit rateLimitFlag
 	fs.Var(&rateLimit, "rate-limit", "opt-in per-vhost rate limiting. Bare: 50r/s, burst 100. Or <rate>:<burst> e.g. 50r/s:100 (rate is <n>r/s|<n>r/m). Off by default; ignored with --allow=cf.")
@@ -144,7 +153,7 @@ func Run(args []string, d Deps) int {
 	pos := fs.Args()
 
 	if *certDir != "" {
-		d.Layout.CertDir = *certDir
+		d.Layout.CertDirs = []string{*certDir}
 	}
 
 	// Mode dispatch
@@ -302,7 +311,7 @@ func printUsage(w io.Writer) {
 	fmt.Fprintln(w, "    rate-limit = off (default) | bare (50r/s, burst 100) | rate:burst e.g. 50r/s:100")
 	fmt.Fprintln(w, "    target   = ip[:port] | host[:port]   (proxy mode)")
 	fmt.Fprintln(w, "             = /absolute/path/to/htmldir (static mode, must exist)")
-	fmt.Fprintln(w, "    cert-dir = lookup base for <host>/fullchain.pem (default: $NGINX_CERT_DIR or /etc/letsencrypt/live)")
+	fmt.Fprintln(w, "    cert-dir = lookup base for <host>/{fullchain.pem,privkey.pem | cert.pem,key.pem | <dir>.crt,<dir>.key} (default: $NGINX_CERT_DIR, else /etc/letsencrypt/live then /etc/nginx/ssl)")
 	fmt.Fprintln(w, "  nginx-gen --main [--brotli=auto|on|off] [--force] [--dry-run] [--no-reload]")
 	fmt.Fprintln(w, "  nginx-gen --remove <host>")
 	fmt.Fprintln(w, "  nginx-gen --list")
@@ -444,12 +453,13 @@ func runVhost(d Deps, o vhostOpts) int {
 	}
 
 	if o.SSL {
-		certDir, err := cert.Resolve(host, d.Layout.CertDir)
+		pair, err := cert.Resolve(host, d.Layout.CertDirs)
 		if err != nil {
 			fmt.Fprintln(d.Stderr, "cert:", err)
 			return exitUserError
 		}
-		cfg.CertDir = certDir
+		cfg.CertFile = pair.Cert
+		cfg.KeyFile = pair.Key
 	}
 
 	rendered, err := render.Vhost(cfg)
@@ -616,7 +626,11 @@ func runMain(d Deps, force, dryRun, noReload bool, brotliMode BrotliMode) int {
 	if hardErr {
 		return exitUserError
 	}
-	rendered, err := render.Main(render.MainCfg{Now: d.Now(), Brotli: brotli})
+	rendered, err := render.Main(render.MainCfg{
+		Now:             d.Now(),
+		Brotli:          brotli,
+		RejectHandshake: rejectHandshakeSupported(d),
+	})
 	if err != nil {
 		fmt.Fprintln(d.Stderr, "render main:", err)
 		return exitSystemErr
@@ -669,6 +683,24 @@ func runMain(d Deps, force, dryRun, noReload bool, brotliMode BrotliMode) int {
 		"backup": backupPath, "result": "ok",
 	})
 	return exitOK
+}
+
+// rejectHandshakeSupported reports false only for a detected nginx older than
+// 1.19.4. An unknown version renders the directive, so `nginx -t` rejects an
+// unsupported build instead of the :443 catch-all being dropped silently.
+func rejectHandshakeSupported(d Deps) bool {
+	probe := d.NginxVersion
+	if probe == nil {
+		probe = func() (nginx.VersionInfo, error) { return nginx.Version(d.Exec) }
+	}
+	vi, err := probe()
+	if err != nil || vi.SupportsRejectHandshake() {
+		return true
+	}
+	fmt.Fprintf(d.Stderr, "warning: nginx %d.%d.%d has no ssl_reject_handshake (needs >= 1.19.4); "+
+		"the :443 catch-all is omitted and a client without a matching SNI gets the first vhost's certificate\n",
+		vi.Major, vi.Minor, vi.Patch)
+	return false
 }
 
 // ---- remove ----

@@ -142,7 +142,7 @@ nginx-gen --domains
 | `--allow`           | unset                | `cf` → Cloudflare IPs. Or comma-separated CIDRs/IPs. |
 | `--hsts`            | `off`                | `on` → this host only. `subdomains`, `preload` → see [HSTS](#--hsts) before using. Requires `--ssl`. |
 | `--rate-limit`      | `off`                | Opt-in per-vhost rate limiting. Bare `--rate-limit` = `50r/s`, burst 100. `--rate-limit=rate:burst` (e.g. `50r/s:100`) sets both. Ignored with `--allow=cf`. See [Rate limiting](#rate-limiting). |
-| `--cert-dir`        | `/etc/letsencrypt/live` | Cert lookup base. Also `$NGINX_CERT_DIR`. |
+| `--cert-dir`        | `/etc/letsencrypt/live`, then `/etc/nginx/ssl` | Cert lookup base. Also `$NGINX_CERT_DIR`. A set value replaces both defaults. |
 | `--brotli`          | `auto`               | `auto` = best-effort. `on` = require/build. `off` = skip entirely. |
 | `--channel`         | `mainline`           | nginx.org repo channel (only for `--install` / `--bootstrap`). |
 | `--dry-run`         | `false`              | Print plan to stdout, no FS changes. |
@@ -220,12 +220,28 @@ Then `nginx -s reload`. nginx-gen will not touch it.
 
 ## Wildcard certs (auto-detect)
 
-`--ssl=true` resolves the cert dir by walking up the host's domain labels:
-`a.b.example.com` → tries `<cert-dir>/a.b.example.com`, then `b.example.com`,
-then `example.com`. First directory containing `fullchain.pem` wins.
+`--ssl=true` resolves the cert by walking up the host's domain labels:
+`a.b.example.com` → tries `<base>/a.b.example.com`, then `b.example.com`,
+then `example.com`.
 
-Default base is `/etc/letsencrypt/live` (override via `--cert-dir` or
-`$NGINX_CERT_DIR`). For Cloudflare Origin certs: `--cert-dir=/etc/ssl/cf`.
+Default bases are `/etc/letsencrypt/live`, then `/etc/nginx/ssl`. The search
+walks all labels in the first base before it tries the second base, so an
+existing letsencrypt cert keeps priority. `--cert-dir` or `$NGINX_CERT_DIR`
+replaces both defaults and must be an absolute path. For Cloudflare Origin
+certs: `--cert-dir=/etc/ssl/cf`.
+
+In each directory the first complete pair wins:
+
+| Cert                | Key                 |
+|---------------------|---------------------|
+| `fullchain.pem`     | `privkey.pem`       |
+| `cert.pem`          | `key.pem`           |
+| `<dir>.crt`         | `<dir>.key`         |
+
+`<dir>` is the directory name, e.g. `/etc/nginx/ssl/example.com/example.com.crt`.
+A directory with only one file of a pair is an error, not a miss. An
+unreadable directory in an earlier base stops the search with an error. A cert path
+with whitespace, `;`, `{`, `}`, quotes, `#`, `$` or `\` is refused.
 
 ## `--hsts`
 
@@ -312,6 +328,37 @@ limiting opt-in. A vhost file written by an older build still references
 reference fails closed — the reload is refused and the running config keeps
 serving — but the update is blocked until the vhost is re-rendered.
 `nginx-gen --list` shows `ratelimit=?` for a vhost that predates the flag.
+
+## Origin hiding
+
+`--allow` applies to the `:80` redirect server as well as the `:443` server.
+A client outside the allow list gets `403` on both ports and never sees the
+`Location: https://<host>/` redirect. The redirect sits in `location @https`
+behind `try_files`, because a server-level `return` runs before `allow`/`deny`.
+
+`--main` renders a catch-all `default_server` for a request that matches no
+vhost:
+
+- `:80` — `return 444` (close the connection, no response).
+- `:443` — `ssl_reject_handshake on`, so a client with no SNI or an unknown
+  SNI gets no certificate. A scan by IP alone cannot read a vhost name from
+  the cert. A client that sends no SNI cannot reach any vhost on `:443`.
+
+`ssl_reject_handshake` needs nginx >= 1.19.4. On an older nginx, `--main`
+omits the `:443` catch-all and prints a warning. Any other
+`listen ... default_server` in `conf.d/*.conf` or `sites-enabled/*.conf` makes
+`nginx -t` fail, and `--main` rolls back.
+
+A request to `:80` by IP or with an unknown Host, such as a load-balancer
+health check, gets `444`. Run `--main` again after an upgrade to get the
+catch-all; a vhost render alone does not add it.
+
+Limits: a client that already knows the hostname still confirms the origin.
+It gets the vhost certificate when it sends that SNI, because the TLS
+handshake runs before `allow`/`deny`, and it gets `403` where an unknown host
+gets `444`. Full origin hiding needs an L4 filter (nftables or a cloud
+firewall) that restricts `:80`/`:443` to the allow list, for example the
+Cloudflare ranges for `--allow=cf`.
 
 ## `--allow=cf`
 

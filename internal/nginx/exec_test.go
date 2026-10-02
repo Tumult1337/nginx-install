@@ -70,3 +70,23 @@ func TestReloadCallsSystemctl(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+func TestSupportsRejectHandshake(t *testing.T) {
+	cases := []struct {
+		v    VersionInfo
+		want bool
+	}{
+		{VersionInfo{1, 19, 3}, false},
+		{VersionInfo{1, 19, 4}, true},
+		{VersionInfo{1, 18, 99}, false},
+		{VersionInfo{1, 20, 0}, true},
+		{VersionInfo{1, 30, 5}, true},
+		{VersionInfo{0, 99, 99}, false},
+		{VersionInfo{2, 0, 0}, true},
+	}
+	for _, c := range cases {
+		if got := c.v.SupportsRejectHandshake(); got != c.want {
+			t.Errorf("%+v.SupportsRejectHandshake() = %v, want %v", c.v, got, c.want)
+		}
+	}
+}

@@ -3,13 +3,7 @@ limit_req_zone  $binary_remote_addr zone={{ .ReqZone }}:10m rate={{ .RateLimitRa
 limit_conn_zone $binary_remote_addr zone={{ .ConnZone }}:10m;
 {{ end -}}
 {{- if .SSL }}
-server {
-    listen 80;
-    listen [::]:80;
-    server_name {{ .Host }};
-    return 301 https://$host$request_uri;
-}
-{{ end }}
+{{ template "https_redirect" . }}{{ end }}
 server {
 {{- if .SSL }}
 {{- if .HTTP2Inline }}
@@ -21,8 +15,8 @@ server {
     http2 on;
 {{- end }}
 
-    ssl_certificate     {{ .CertDir }}/fullchain.pem;
-    ssl_certificate_key {{ .CertDir }}/privkey.pem;
+    ssl_certificate     {{ .CertFile }};
+    ssl_certificate_key {{ .KeyFile }};
 {{- with .HSTSHeader }}
     add_header Strict-Transport-Security "{{ . }}" always;
 {{- end }}
@@ -40,16 +34,7 @@ server {
 {{- end }}
 
     server_name {{ .Host }};
-{{- if .IsCF }}
-
-    include /etc/nginx/snippets/cf-allow.conf;
-{{- else if .IsList }}
-
-{{- range .AllowCIDRs }}
-    allow {{ . }};
-{{- end }}
-    deny all;
-{{- end }}
+{{- template "acl" . }}
 
 {{- if .RateLimited }}
     limit_conn {{ .ConnZone }} {{ .RateLimitConn }};

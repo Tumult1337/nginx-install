@@ -158,6 +158,21 @@ http {
 
     access_log /var/log/nginx/access.log json buffer=64k flush=5s if=$loggable;
 
+    # Catch-all for an unknown Host, so a client that scans the IP gets no response.
+    server {
+        listen 80 default_server;
+        listen [::]:80 default_server;
+{{- if .RejectHandshake }}
+        # Rejects a TLS handshake with no SNI or an unknown SNI, so no certificate is sent.
+        listen 443 ssl default_server;
+        listen [::]:443 ssl default_server;
+        ssl_reject_handshake on;
+{{- end }}
+        server_name _;
+        access_log  off;
+        return      444;
+    }
+
     # Operator-managed http-scope snippets (maps, custom log formats, etc.).
     # nginx-gen never writes here — drop your own .conf files in conf.d/ and
     # they will survive --main re-renders.
