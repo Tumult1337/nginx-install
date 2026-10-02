@@ -228,8 +228,8 @@ func canWriteDir(dir string) bool {
 		return false
 	}
 	name := f.Name()
-	f.Close()
-	os.Remove(name)
+	_ = f.Close()
+	_ = os.Remove(name)
 	return true
 }
 
@@ -251,7 +251,7 @@ func (releaseHTTP) Get(ctx context.Context, url string) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("status %d from %s", resp.StatusCode, url)
 	}

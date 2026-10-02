@@ -6,10 +6,11 @@ import (
 )
 
 // IdempotentSymlink ensures linkPath is a symlink pointing at target.
-// - If linkPath doesn't exist: creates it.
-// - If linkPath is a symlink (regardless of where it points): replaces it.
-// - If linkPath is a regular file or dir: refuses (returns error) — caller
-//   must clean up first; we will not silently destroy non-symlinks.
+//   - If linkPath doesn't exist: creates it.
+//   - If linkPath is a symlink (regardless of where it points): replaces it.
+//   - If linkPath is a regular file or dir: refuses (returns error) — caller
+//     must clean up first; we will not silently destroy non-symlinks.
+//
 // Returns true if a NEW link was created (so callers can roll back on
 // later failure).
 func IdempotentSymlink(target, linkPath string) (created bool, err error) {

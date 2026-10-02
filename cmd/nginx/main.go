@@ -1054,7 +1054,7 @@ func runBrotliBuild(d Deps, force, dryRun bool) int {
 		fmt.Fprintln(d.Stderr, "mktemp:", err)
 		return exitSystemErr
 	}
-	defer os.RemoveAll(tmpDir)
+	defer func() { _ = os.RemoveAll(tmpDir) }()
 
 	tarPath := filepath.Join(tmpDir, "nginx.tar.gz")
 	tarURL := fmt.Sprintf("https://nginx.org/download/nginx-%s.tar.gz", version)

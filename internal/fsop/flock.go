@@ -15,7 +15,7 @@ func Flock(path string) (release func(), err error) {
 		return nil, fmt.Errorf("open lock %s: %w", path, err)
 	}
 	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX); err != nil {
-		f.Close()
+		_ = f.Close()
 		return nil, fmt.Errorf("flock %s: %w", path, err)
 	}
 	return func() {
