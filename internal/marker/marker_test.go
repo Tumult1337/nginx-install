@@ -167,3 +167,52 @@ func TestParsePreRateLimitMarker(t *testing.T) {
 		t.Errorf("other fields corrupted: %+v", h)
 	}
 }
+
+func TestEqualIgnoringTS(t *testing.T) {
+	early := time.Date(2026, 5, 3, 12, 0, 0, 0, time.UTC)
+	late := early.Add(time.Hour)
+	vhost := func(host string, ts time.Time, body string) []byte {
+		return []byte(RenderVhost(Header{Host: host, Mode: "proxy", SSL: true, Allow: "none", HSTS: "off", TS: ts}) + body)
+	}
+	mainConf := func(ts time.Time, body string) []byte {
+		return []byte(RenderMain(ts) + body)
+	}
+	unmanaged := []byte("server { listen 80; }\n")
+
+	cases := []struct {
+		name string
+		a, b []byte
+		want bool
+	}{
+		{"vhost differs only in ts", vhost("a.com", early, "server{}\n"), vhost("a.com", late, "server{}\n"), true},
+		{"main differs only in ts", mainConf(early, "events{}\n"), mainConf(late, "events{}\n"), true},
+		{"identical", vhost("a.com", early, "server{}\n"), vhost("a.com", early, "server{}\n"), true},
+		{"line 2 field differs", vhost("a.com", early, "server{}\n"), vhost("b.com", early, "server{}\n"), false},
+		{"line 2 field and ts differ", vhost("a.com", early, "server{}\n"), vhost("b.com", late, "server{}\n"), false},
+		{"body differs", vhost("a.com", early, "server{}\n"), vhost("a.com", early, "server{ }\n"), false},
+		{"body differs and ts differs", mainConf(early, "events{}\n"), mainConf(late, "events{ }\n"), false},
+		{"kind differs", mainConf(early, "x\n"), vhost("a.com", early, "x\n"), false},
+		{"unmanaged first", unmanaged, vhost("a.com", early, "server{}\n"), false},
+		{"unmanaged second", vhost("a.com", early, "server{}\n"), unmanaged, false},
+		{"both unmanaged and equal", unmanaged, unmanaged, false},
+		{"empty", nil, nil, false},
+		{"CRLF on line 2", []byte(FirstLine + "\n# kind=main ts=2026-05-03T12:00:00Z\r\nx\n"), []byte(FirstLine + "\n# kind=main ts=2026-05-03T13:00:00Z\r\nx\n"), false},
+		{"NUL after ts value", []byte(FirstLine + "\n# kind=main ts=2026-05-03T12:00:00Zjunk\x00\nx\n"), []byte(FirstLine + "\n# kind=main ts=2026-05-03T13:00:00Zjunk\x00\nx\n"), false},
+		{"vertical tab in ts value", []byte(FirstLine + "\n# kind=main ts=2026-05-03\v12:00:00Z\nx\n"), []byte(FirstLine + "\n# kind=main ts=2026-05-03\v13:00:00Z\nx\n"), false},
+		{"no ts field against ts field", []byte(FirstLine + "\n# kind=main\nx\n"), []byte(FirstLine + "\n# kind=main ts=2026-05-03T12:00:00Z\nx\n"), false},
+		{"garbage ts against valid ts", []byte(FirstLine + "\n# kind=main ts=garbage\nx\n"), []byte(FirstLine + "\n# kind=main ts=2026-05-03T12:00:00Z\nx\n"), false},
+		{"garbage ts on both sides", []byte(FirstLine + "\n# kind=main ts=garbage\nx\n"), []byte(FirstLine + "\n# kind=main ts=other\nx\n"), false},
+		{"extra field after ts", []byte(FirstLine + "\n# kind=main ts=2026-05-03T12:00:00Z extra=1\nx\n"), []byte(FirstLine + "\n# kind=main ts=2026-05-03T13:00:00Z\nx\n"), false},
+		{
+			"ts text in body is not ignored",
+			vhost("a.com", early, "# note ts=2026-01-01T00:00:00Z\n"),
+			vhost("a.com", early, "# note ts=2027-01-01T00:00:00Z\n"),
+			false,
+		},
+	}
+	for _, c := range cases {
+		if got := EqualIgnoringTS(c.a, c.b); got != c.want {
+			t.Errorf("%s: got %t, want %t", c.name, got, c.want)
+		}
+	}
+}

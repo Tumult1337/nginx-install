@@ -87,6 +87,14 @@ type Deps struct {
 	Stdout       io.Writer
 	Stderr       io.Writer
 	NginxVersion func() (nginx.VersionInfo, error)
+	Geteuid      func() int
+}
+
+func (d Deps) effectiveUID() int {
+	if d.Geteuid == nil {
+		return os.Geteuid()
+	}
+	return d.Geteuid()
 }
 
 func DefaultDeps() Deps {
@@ -99,6 +107,7 @@ func DefaultDeps() Deps {
 		Now:         time.Now,
 		Stdout:      os.Stdout,
 		Stderr:      os.Stderr,
+		Geteuid:     os.Geteuid,
 		NginxVersion: sync.OnceValues(func() (nginx.VersionInfo, error) {
 			return nginx.Version(exec)
 		}),
@@ -128,7 +137,7 @@ func Run(args []string, d Deps) int {
 	doBrotliBuild := fs.Bool("brotli-build", false, "compile ngx_brotli dynamic modules against the installed nginx (for hosts where the Debian brotli packages are ABI-incompatible)")
 	doInstall := fs.Bool("install", false, "bootstrap a fresh nginx install: add nginx.org repo, apt-get install nginx, render managed nginx.conf, optionally build brotli")
 	doBootstrap := fs.Bool("bootstrap", false, "first-time host setup: --install + --sysctl in one shot (idempotent, safe to rerun)")
-	doUpgrade := fs.Bool("upgrade", false, "apt-upgrade the nginx package, rebuild brotli if version drifted, re-render nginx.conf, restart. (Does NOT touch the nginx-gen tool — use --self-update for that.)")
+	doUpgrade := fs.Bool("upgrade", false, "apt-upgrade the nginx package, rebuild an nginx-gen brotli build if version drifted (--force rebuilds it anyway), upgrade packaged brotli with apt, restart. Never writes nginx.conf. (Does NOT touch the nginx-gen tool — use --self-update for that.)")
 	doABICheck := fs.Bool("abi-check", false, "print nginx + brotli ABI sync status; exit 1 on drift (suitable for cron/nagios)")
 	doConvert := fs.Bool("convert", false, "best-effort migration of an existing (Debian/other) nginx install into nginx-gen's managed setup; snapshots /etc/nginx + writes a rollback script before touching anything")
 	doSelfUpdate := fs.Bool("self-update", false, "replace this nginx-gen binary with the latest GitHub release (verified by sha256). Does NOT touch nginx itself — use --upgrade for that.")
@@ -320,7 +329,7 @@ func printUsage(w io.Writer) {
 	fmt.Fprintln(w, "  nginx-gen --brotli-build  [--force] [--dry-run]")
 	fmt.Fprintln(w, "  nginx-gen --install    [--channel=mainline|stable] [--brotli=auto|on|off] [--force] [--dry-run]")
 	fmt.Fprintln(w, "  nginx-gen --bootstrap  [--channel=mainline|stable] [--brotli=auto|on|off] [--force] [--dry-run] [--no-reload]")
-	fmt.Fprintln(w, "  nginx-gen --upgrade        [--force] [--dry-run] [--no-reload]")
+	fmt.Fprintln(w, "  nginx-gen --upgrade        [--force] [--dry-run] [--no-reload]   (--force rebuilds an nginx-gen brotli build; never writes nginx.conf)")
 	fmt.Fprintln(w, "  nginx-gen --abi-check       (exit 0 if nginx+brotli ABIs match; 1 on drift)")
 	fmt.Fprintln(w, "  nginx-gen --convert    [--channel=mainline|stable] [--brotli=auto|on|off] [--dry-run] [--no-reload]")
 	fmt.Fprintln(w, "  nginx-gen --self-update  [--force] [--dry-run]")
@@ -514,18 +523,13 @@ func runVhost(d Deps, o vhostOpts) int {
 		warnHSTSDowngrade(d.Stderr, host, prev, cfg.HSTS)
 	}
 
-	backupPath, err := fsop.Backup(targetAvail, d.Layout.BackupDir)
-	if err != nil {
-		fmt.Fprintln(d.Stderr, "backup:", err)
-		return exitSystemErr
-	}
-
 	if err := os.MkdirAll(d.Layout.SitesAvailable, 0755); err != nil {
 		fmt.Fprintln(d.Stderr, "mkdir sites-available:", err)
 		return exitSystemErr
 	}
-	if err := fsop.AtomicWrite(targetAvail, rendered, 0644); err != nil {
-		fmt.Fprintln(d.Stderr, "write:", err)
+	backupPath, changed, err := writeManaged(d, targetAvail, rendered, marker.EqualIgnoringTS)
+	if err != nil {
+		fmt.Fprintln(d.Stderr, err)
 		return exitSystemErr
 	}
 
@@ -536,15 +540,18 @@ func runVhost(d Deps, o vhostOpts) int {
 	createdLink, err := fsop.IdempotentSymlink(targetAvail, targetLink)
 	if err != nil {
 		fmt.Fprintln(d.Stderr, "symlink:", err)
-		// Roll back the file write.
-		rollback(d, targetAvail, backupPath)
+		if changed {
+			rollback(d, targetAvail, backupPath)
+		}
 		return exitSystemErr
 	}
 
 	if !o.NoReload {
 		if err := nginx.Test(d.Exec); err != nil {
 			fmt.Fprintln(d.Stderr, err)
-			rollback(d, targetAvail, backupPath)
+			if changed {
+				rollback(d, targetAvail, backupPath)
+			}
 			if createdLink {
 				_ = os.Remove(targetLink)
 			}
@@ -561,7 +568,7 @@ func runVhost(d Deps, o vhostOpts) int {
 		"mode": cfg.Mode.String(), "ssl": o.SSL, "allow": cfg.Allow.String(),
 		"hsts":            cfg.HSTS.String(),
 		"upstream_scheme": cfg.UpstreamProto(), "upstream_verify": cfg.UpstreamVerify,
-		"backup": backupPath, "result": "ok",
+		"backup": backupPath, "changed": changed, "result": "ok",
 	})
 	return exitOK
 }
@@ -599,6 +606,56 @@ func warnHSTSDowngrade(w io.Writer, host string, prev marker.Header, next render
 	fmt.Fprintf(w, "note: %s previously sent HSTS (%s); this run writes %s.\n", host, was, next)
 	fmt.Fprintf(w, "      Pass --hsts=%s to keep it. Browsers honor the cached directive\n", was)
 	fmt.Fprintln(w, "      until it expires (up to 2y) regardless of this config.")
+}
+
+type preparedWrite struct {
+	path       string
+	content    []byte
+	backupPath string
+	changed    bool
+}
+
+func prepareManaged(d Deps, path string, content []byte, same func(old, new []byte) bool) (preparedWrite, error) {
+	prepared := preparedWrite{path: path, content: content}
+	existing, err := os.ReadFile(path)
+	if err != nil && !os.IsNotExist(err) {
+		return preparedWrite{}, fmt.Errorf("read: %w", err)
+	}
+	exists := err == nil
+	if exists && same(existing, content) {
+		fmt.Fprintln(d.Stderr, "unchanged:", path)
+		return prepared, nil
+	}
+	prepared.changed = true
+	if !exists {
+		return prepared, nil
+	}
+	prepared.backupPath, err = fsop.Backup(path, existing, d.Now(), d.Layout.BackupDir)
+	if err != nil {
+		return preparedWrite{}, fmt.Errorf("backup: %w", err)
+	}
+	return prepared, nil
+}
+
+func (p preparedWrite) write() error {
+	if !p.changed {
+		return nil
+	}
+	if err := fsop.AtomicWrite(p.path, p.content, 0644); err != nil {
+		return fmt.Errorf("write: %w", err)
+	}
+	return nil
+}
+
+func writeManaged(d Deps, path string, content []byte, same func(old, new []byte) bool) (backupPath string, changed bool, err error) {
+	prepared, err := prepareManaged(d, path, content, same)
+	if err != nil {
+		return "", false, err
+	}
+	if err := prepared.write(); err != nil {
+		return "", false, err
+	}
+	return prepared.backupPath, prepared.changed, nil
 }
 
 func rollback(d Deps, target, backup string) {
@@ -657,20 +714,18 @@ func runMain(d Deps, force, dryRun, noReload bool, brotliMode BrotliMode) int {
 		return exitUserError
 	}
 
-	backupPath, err := fsop.Backup(d.Layout.MainConfPath, d.Layout.BackupDir)
+	backupPath, changed, err := writeManaged(d, d.Layout.MainConfPath, rendered, marker.EqualIgnoringTS)
 	if err != nil {
-		fmt.Fprintln(d.Stderr, "backup:", err)
-		return exitSystemErr
-	}
-	if err := fsop.AtomicWrite(d.Layout.MainConfPath, rendered, 0644); err != nil {
-		fmt.Fprintln(d.Stderr, "write:", err)
+		fmt.Fprintln(d.Stderr, err)
 		return exitSystemErr
 	}
 
 	if !noReload {
 		if err := nginx.Test(d.Exec); err != nil {
 			fmt.Fprintln(d.Stderr, err)
-			rollback(d, d.Layout.MainConfPath, backupPath)
+			if changed {
+				rollback(d, d.Layout.MainConfPath, backupPath)
+			}
 			return exitValidation
 		}
 		if err := nginx.Reload(d.Exec); err != nil {
@@ -680,7 +735,7 @@ func runMain(d Deps, force, dryRun, noReload bool, brotliMode BrotliMode) int {
 	}
 
 	logEvent(d.Stderr, d.Now(), "main-write", "", map[string]any{
-		"backup": backupPath, "result": "ok",
+		"backup": backupPath, "changed": changed, "result": "ok",
 	})
 	return exitOK
 }
@@ -957,27 +1012,31 @@ func runSysctl(d Deps, force, dryRun, noReload bool) int {
 		}
 	}
 
-	backupSysctl, err := fsop.Backup(d.Layout.SysctlPath, d.Layout.BackupDir)
-	if err != nil {
-		fmt.Fprintln(d.Stderr, "backup sysctl:", err)
-		return exitSystemErr
-	}
-	backupOverride, err := fsop.Backup(overridePath, d.Layout.BackupDir)
-	if err != nil {
-		fmt.Fprintln(d.Stderr, "backup systemd override:", err)
-		return exitSystemErr
-	}
-
-	if err := fsop.AtomicWrite(d.Layout.SysctlPath, []byte(sysctl), 0644); err != nil {
-		fmt.Fprintln(d.Stderr, "write sysctl:", err)
-		return exitSystemErr
-	}
 	if err := os.MkdirAll(d.Layout.SystemdOverrideDir, 0755); err != nil {
 		fmt.Fprintln(d.Stderr, "mkdir systemd override dir:", err)
 		return exitSystemErr
 	}
-	if err := fsop.AtomicWrite(overridePath, []byte(override), 0644); err != nil {
-		fmt.Fprintln(d.Stderr, "write systemd override:", err)
+	sysctlPrepared, err := prepareManaged(d, d.Layout.SysctlPath, []byte(sysctl), bytes.Equal)
+	if err != nil {
+		fmt.Fprintln(d.Stderr, "sysctl:", err)
+		return exitSystemErr
+	}
+	overridePrepared, err := prepareManaged(d, overridePath, []byte(override), bytes.Equal)
+	if err != nil {
+		fmt.Fprintln(d.Stderr, "systemd override:", err)
+		return exitSystemErr
+	}
+	backupSysctl, sysctlChanged := sysctlPrepared.backupPath, sysctlPrepared.changed
+	backupOverride, overrideChanged := overridePrepared.backupPath, overridePrepared.changed
+	if err := sysctlPrepared.write(); err != nil {
+		fmt.Fprintln(d.Stderr, "sysctl:", err)
+		return exitSystemErr
+	}
+	if err := overridePrepared.write(); err != nil {
+		fmt.Fprintln(d.Stderr, "systemd override:", err)
+		if sysctlChanged {
+			rollback(d, d.Layout.SysctlPath, backupSysctl)
+		}
 		return exitSystemErr
 	}
 
@@ -992,13 +1051,19 @@ func runSysctl(d Deps, force, dryRun, noReload bool) int {
 
 		if out, err := d.Exec.Run("sysctl", "--system"); err != nil {
 			fmt.Fprintln(d.Stderr, "sysctl --system failed:", string(out))
-			rollback(d, d.Layout.SysctlPath, backupSysctl)
-			rollback(d, overridePath, backupOverride)
+			if sysctlChanged {
+				rollback(d, d.Layout.SysctlPath, backupSysctl)
+			}
+			if overrideChanged {
+				rollback(d, overridePath, backupOverride)
+			}
 			return exitSystemErr
 		}
 		if out, err := d.Exec.Run("systemctl", "daemon-reload"); err != nil {
 			fmt.Fprintln(d.Stderr, "systemctl daemon-reload failed:", string(out))
-			rollback(d, overridePath, backupOverride)
+			if overrideChanged {
+				rollback(d, overridePath, backupOverride)
+			}
 			return exitSystemErr
 		}
 		// Restart (not reload) required to pick up new LimitNOFILE.
@@ -1010,9 +1075,11 @@ func runSysctl(d Deps, force, dryRun, noReload bool) int {
 	}
 
 	logEvent(d.Stderr, d.Now(), "sysctl-write", "", map[string]any{
-		"sysctl_backup":   backupSysctl,
-		"override_backup": backupOverride,
-		"result":          "ok",
+		"sysctl_backup":    backupSysctl,
+		"override_backup":  backupOverride,
+		"sysctl_changed":   sysctlChanged,
+		"override_changed": overrideChanged,
+		"result":           "ok",
 	})
 	return exitOK
 }
@@ -1219,16 +1286,14 @@ func brotliBuildVersion(modulesEnabledDir string) string {
 }
 
 // runNginxUpgrade applies apt upgrades to nginx, rebuilds brotli if the new
-// nginx version differs from what brotli was compiled against, re-renders
-// nginx.conf (in case the template was updated alongside the binary), and
-// restarts. Idempotent: a no-op apt + matching brotli version + already-
-// managed conf exits in ~2 s with nothing changed.
+// nginx version differs from what brotli was compiled against, validates the
+// config, and restarts. It never writes nginx.conf.
 func runNginxUpgrade(d Deps, dryRun, force, noReload bool) int {
 	if dryRun {
 		printNginxUpgradeRecipe(d.Stdout)
 		return exitOK
 	}
-	if os.Geteuid() != 0 {
+	if d.effectiveUID() != 0 {
 		fmt.Fprintln(d.Stderr, "--upgrade requires root (apt-get + writes to /etc)")
 		return exitUserError
 	}
@@ -1247,8 +1312,14 @@ func runNginxUpgrade(d Deps, dryRun, force, noReload bool) int {
 		fmt.Fprintln(d.Stderr, strings.TrimSpace(string(out)))
 		return exitSystemErr
 	}
+	installedBrotliPackages := installedPackages(d, brotliPackages)
+	source := classifyBrotliSource(d.Layout.ModulesEnabledDir, len(installedBrotliPackages) > 0)
+	upgradePackages := []string{"nginx"}
+	if source == brotliSourcePackaged {
+		upgradePackages = append(upgradePackages, installedBrotliPackages...)
+	}
 	fmt.Fprintln(d.Stderr, "upgrading nginx (if newer available)...")
-	if out, err := aptInstall(d, "--only-upgrade", "-y", "nginx"); err != nil {
+	if out, err := aptInstall(d, append([]string{"--only-upgrade", "-y"}, upgradePackages...)...); err != nil {
 		fmt.Fprintln(d.Stderr, "apt-get install --only-upgrade nginx failed:", err)
 		fmt.Fprintln(d.Stderr, strings.TrimSpace(string(out)))
 		return exitSystemErr
@@ -1270,24 +1341,33 @@ func runNginxUpgrade(d Deps, dryRun, force, noReload bool) int {
 		fmt.Fprintf(d.Stderr, "nginx upgraded: %s → %s\n", preVer, postVer)
 	}
 
-	brotliWasInstalled := brotliModuleLoaded(d.Layout.ModulesEnabledDir)
-	builtVer := brotliBuildVersion(d.Layout.ModulesEnabledDir)
-	needRebuild := brotliWasInstalled && (force || builtVer != postVer)
-	if needRebuild {
-		fmt.Fprintf(d.Stderr, "rebuilding brotli (was built against %s, nginx is %s)...\n",
-			cmpOrFallback(builtVer, "unknown"), postVer)
-		if code := runBrotliBuild(d, true, false); code != exitOK {
-			return code
+	rebuilt := false
+	switch source {
+	case brotliSourceOwn:
+		builtVer := brotliBuildVersion(d.Layout.ModulesEnabledDir)
+		if force || builtVer != postVer {
+			fmt.Fprintf(d.Stderr, "rebuilding brotli (was built against %s, nginx is %s)...\n",
+				cmpOrFallback(builtVer, "unknown"), postVer)
+			if code := runBrotliBuild(d, true, false); code != exitOK {
+				return code
+			}
+			rebuilt = true
+		}
+	case brotliSourcePackaged:
+		if !brotliModuleLoaded(d.Layout.ModulesEnabledDir) {
+			fmt.Fprintln(d.Stderr, "the packaged brotli module is gone after the upgrade; nginx-gen compiles it from source")
+			if code := runBrotliBuild(d, false, false); code != exitOK {
+				fmt.Fprintln(d.Stderr, "brotli build from source failed (exit", strconv.Itoa(code)+")")
+			} else {
+				rebuilt = true
+			}
 		}
 	}
 
-	// Re-render with brotli iff it's installed (preserves prior state).
-	renderMode := BrotliOff
-	if brotliWasInstalled {
-		renderMode = BrotliOn
-	}
-	if code := runMain(d, true, false, true, renderMode); code != exitOK {
-		return code
+	if mainConfUsesBrotli(d.Layout.MainConfPath) && !brotliModuleLoaded(d.Layout.ModulesEnabledDir) {
+		fmt.Fprintln(d.Stderr, "nginx.conf has brotli directives but the brotli module is gone after the upgrade.")
+		fmt.Fprintln(d.Stderr, "Run `nginx-gen --main` to render a config that matches this host, or `nginx-gen --brotli-build` to restore the module.")
+		return exitValidation
 	}
 
 	if err := nginx.Test(d.Exec); err != nil {
@@ -1309,10 +1389,73 @@ func runNginxUpgrade(d Deps, dryRun, force, noReload bool) int {
 	logEvent(d.Stderr, d.Now(), "nginx-upgrade", "", map[string]any{
 		"nginx_from":     preVer,
 		"nginx_to":       postVer,
-		"brotli_rebuilt": needRebuild,
+		"brotli_rebuilt": rebuilt,
+		"brotli_source":  source.String(),
 		"result":         "ok",
 	})
 	return exitOK
+}
+
+type brotliSource int
+
+const (
+	brotliSourceNone brotliSource = iota
+	brotliSourceOwn
+	brotliSourcePackaged
+	brotliSourceOther
+)
+
+func (b brotliSource) String() string {
+	switch b {
+	case brotliSourceOwn:
+		return "own"
+	case brotliSourcePackaged:
+		return "packaged"
+	case brotliSourceOther:
+		return "other"
+	}
+	return "none"
+}
+
+func classifyBrotliSource(modulesEnabledDir string, packagesInstalled bool) brotliSource {
+	if brotliBuildVersion(modulesEnabledDir) != "" {
+		return brotliSourceOwn
+	}
+	if !brotliModuleLoaded(modulesEnabledDir) {
+		return brotliSourceNone
+	}
+	if packagesInstalled {
+		return brotliSourcePackaged
+	}
+	return brotliSourceOther
+}
+
+func installedPackages(d Deps, packages []string) []string {
+	var installed []string
+	for _, pkg := range packages {
+		out, err := d.Exec.Run("dpkg-query", "-W", "-f=${db:Status-Abbrev}", pkg)
+		if err == nil && strings.HasPrefix(string(out), "ii") {
+			installed = append(installed, pkg)
+		}
+	}
+	return installed
+}
+
+func mainConfUsesBrotli(path string) bool {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return false
+	}
+	for line := range strings.Lines(string(data)) {
+		fields := strings.Fields(line)
+		if len(fields) == 0 {
+			continue
+		}
+		if fields[0] == "brotli" || strings.HasPrefix(fields[0], "brotli_") {
+			return true
+		}
+	}
+	return false
 }
 
 func cmpOrFallback(s, fallback string) string {
@@ -1327,9 +1470,13 @@ func printNginxUpgradeRecipe(w io.Writer) {
 	fmt.Fprintln(w, "apt-get update")
 	fmt.Fprintln(w, "apt-get install --only-upgrade -y nginx")
 	fmt.Fprintln(w, "[probe new nginx -v]")
-	fmt.Fprintln(w, "if brotli previously installed AND new nginx version != built-against:")
+	fmt.Fprintln(w, "if brotli came from apt packages (dpkg-query): add the installed brotli packages to the apt-get call")
+	fmt.Fprintln(w, "    if the packaged module is gone afterwards: compile it from source (--brotli-build)")
+	fmt.Fprintln(w, "if brotli is an nginx-gen build AND (new nginx version != built-against OR --force):")
 	fmt.Fprintln(w, "    rerun --brotli-build --force against the new nginx")
-	fmt.Fprintln(w, "render /etc/nginx/nginx.conf via --main (brotli preserved from prior state)")
+	fmt.Fprintln(w, "if a brotli module from another source is loaded: leave it alone")
+	fmt.Fprintln(w, "if nginx.conf has brotli directives AND the brotli module is not loaded:")
+	fmt.Fprintln(w, "    stop with an error; run nginx-gen --main (nginx.conf is never written)")
 	fmt.Fprintln(w, "nginx -t")
 	fmt.Fprintln(w, "systemctl restart nginx")
 }
@@ -1412,7 +1559,7 @@ func runConvert(d Deps, channelStr string, brotliMode BrotliMode, dryRun, noRelo
 	if data, err := os.ReadFile(d.Layout.MainConfPath); err == nil {
 		if bytes.HasPrefix(data, []byte(marker.FirstLine)) {
 			fmt.Fprintln(d.Stderr, "nginx.conf already managed by nginx-gen — nothing to convert.")
-			fmt.Fprintln(d.Stderr, "       use --upgrade to refresh, or --main to re-render.")
+			fmt.Fprintln(d.Stderr, "       use --upgrade to patch nginx, or --main to re-render nginx.conf.")
 			return exitOK
 		}
 	}
@@ -2151,10 +2298,10 @@ func neutralizeLegacy(path string, stderr io.Writer) {
 // stdin is closed — which is exactly how --convert fails on a host with
 // a hand-edited nginx.conf.
 //
-// For --install/--convert/--upgrade specifically, what dpkg leaves
-// behind is overwritten by runMain immediately after, so confold vs
-// confnew doesn't affect the final state — we just need to skip the
-// prompt.
+// For --install/--convert, what dpkg leaves behind is overwritten by
+// runMain immediately after, so confold vs confnew doesn't affect the
+// final state — we just need to skip the prompt. For --upgrade, dpkg keeps a
+// locally modified nginx.conf; nothing in --upgrade rewrites it.
 func aptInstall(d Deps, args ...string) ([]byte, error) {
 	full := append([]string{
 		"-o", "Dpkg::Options::=--force-confdef",

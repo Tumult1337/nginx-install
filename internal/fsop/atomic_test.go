@@ -1,6 +1,7 @@
 package fsop
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"sync"
@@ -47,28 +48,22 @@ func TestAtomicWriteOverwrite(t *testing.T) {
 	}
 }
 
-func TestBackupMissingNoError(t *testing.T) {
-	dir := t.TempDir()
-	dest, err := Backup(filepath.Join(dir, "nope"), filepath.Join(dir, "bak"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if dest != "" {
-		t.Errorf("expected empty dest, got %q", dest)
-	}
-}
+var backupTime = time.Date(2026, 5, 3, 12, 0, 0, 0, time.UTC)
 
-func TestBackupRoundtrip(t *testing.T) {
+func TestBackupWritesGivenBytesWithStampedName(t *testing.T) {
 	dir := t.TempDir()
 	src := filepath.Join(dir, "x.conf")
 	bdir := filepath.Join(dir, "bak")
-	if err := os.WriteFile(src, []byte("v1"), 0644); err != nil {
+	if err := os.WriteFile(src, []byte("on disk"), 0644); err != nil {
 		t.Fatal(err)
 	}
 
-	dest, err := Backup(src, bdir)
+	dest, err := Backup(src, []byte("v1"), backupTime, bdir)
 	if err != nil {
 		t.Fatal(err)
+	}
+	if want := filepath.Join(bdir, "x.conf.20260503T120000Z"); dest != want {
+		t.Errorf("dest: got %q, want %q", dest, want)
 	}
 	b, _ := os.ReadFile(dest)
 	if string(b) != "v1" {
@@ -84,6 +79,59 @@ func TestBackupRoundtrip(t *testing.T) {
 	b, _ = os.ReadFile(src)
 	if string(b) != "v1" {
 		t.Errorf("after restore: %q", b)
+	}
+}
+
+func TestBackupSameTimeKeepsBothBackups(t *testing.T) {
+	dir := t.TempDir()
+	src := filepath.Join(dir, "x.conf")
+	bdir := filepath.Join(dir, "bak")
+
+	first, err := Backup(src, []byte("one"), backupTime, bdir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := Backup(src, []byte("two"), backupTime, bdir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first == second {
+		t.Fatalf("both backups use path %q", first)
+	}
+	for path, want := range map[string]string{first: "one", second: "two"} {
+		b, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if string(b) != want {
+			t.Errorf("%s: got %q, want %q", path, b, want)
+		}
+	}
+}
+
+func TestBackupFailsAfterMaxCollisions(t *testing.T) {
+	dir := t.TempDir()
+	src := filepath.Join(dir, "x.conf")
+	bdir := filepath.Join(dir, "bak")
+
+	for i := range 100 {
+		if _, err := Backup(src, fmt.Appendf(nil, "v%d", i), backupTime, bdir); err != nil {
+			t.Fatalf("backup %d: %v", i, err)
+		}
+	}
+	if _, err := Backup(src, []byte("overflow"), backupTime, bdir); err == nil {
+		t.Fatal("backup 101 must return an error")
+	}
+	entries, err := os.ReadDir(bdir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 100 {
+		t.Errorf("backup entries: got %d, want 100", len(entries))
+	}
+	b, _ := os.ReadFile(filepath.Join(bdir, "x.conf.20260503T120000Z"))
+	if string(b) != "v0" {
+		t.Errorf("first backup was overwritten: %q", b)
 	}
 }
 

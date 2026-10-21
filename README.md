@@ -79,8 +79,14 @@ nginx-gen --install       [--channel=mainline|stable] [--brotli=auto|on|off]
     optionally build brotli. Skips --sysctl.
 
 nginx-gen --upgrade       [--force] [--dry-run] [--no-reload]
-    apt-upgrade the nginx package, auto-rebuild brotli if version drifted,
-    re-render nginx.conf, restart. Idempotent: no-op when nothing changed.
+    apt-upgrade the nginx package (plus the installed apt brotli packages, if
+    brotli came from apt), auto-rebuild an nginx-gen brotli build if version
+    drifted (--force rebuilds it anyway), restart. Never writes nginx.conf.
+    If the apt brotli module is gone after the upgrade, it compiles brotli
+    from source. A brotli module from another source is left alone. Stops
+    with exit 3 if nginx.conf has brotli directives and the brotli module is
+    gone (run --main).
+    Idempotent: no-op when nothing changed.
     NOTE: this upgrades nginx, not the nginx-gen tool itself — see --self-update.
 
 nginx-gen --convert       [--channel=mainline|stable] [--brotli=auto|on|off]
@@ -194,7 +200,7 @@ include /etc/nginx/sites-enabled/*.conf; # nginx-gen-managed vhosts
 
 Drop http-scope snippets (`map`, custom `log_format`, `geo`, additional
 `upstream` blocks, etc.) into `/etc/nginx/conf.d/<sortable-name>.conf` and
-they survive every `--main` / `--upgrade` re-render.
+they survive every `--main` re-render.
 
 Example — language routing map:
 
@@ -410,8 +416,11 @@ enough). `modprobe tcp_bbr` if not already loaded.
 sudo nginx-gen --upgrade
 ```
 
-That's it. Apt-upgrades nginx, rebuilds brotli if version drifted, re-renders,
-runs `nginx -t`, restarts.
+That's it. Apt-upgrades nginx (with the installed apt brotli packages if you
+use them), rebuilds an nginx-gen brotli build if version drifted, compiles
+brotli from source if the apt module is gone after the upgrade, runs
+`nginx -t`, restarts. It never writes `nginx.conf`. Run `--main` yourself
+to pick up template changes.
 
 **Update the nginx-gen tool itself:**
 
@@ -557,14 +566,17 @@ Sysctl, systemd override, and brotli load-module files use a simpler
 
 ## Rollback semantics
 
-For every write:
+For every write of `nginx.conf`, a vhost, the sysctl file, or the systemd override:
 
 1. Take an exclusive flock on `/run/nginx-gen.lock`.
-2. Back up the current file (if any) to `/var/backups/nginx-gen/`.
+2. If the file exists and its content differs, back it up to
+   `/var/backups/nginx-gen/`. An unchanged file gets no backup and no write
+   (the `ts=` marker field is ignored in the compare).
 3. Atomic-write the new contents (tmp + fsync + rename).
 4. Run `nginx -t`. **On failure: restore the backup (or remove if first deploy)
-   and unlink any new symlink.** Exit 3.
-5. Run `systemctl reload nginx` (or `restart` after `--sysctl`/`--upgrade`).
+   of each file this run wrote, and unlink any new symlink.** An unchanged
+   file is never restored or removed. Exit 3.
+5. Run `systemctl reload nginx` (or `restart` after `--sysctl`).
    **Reload/restart failures do NOT roll back** — the config is valid;
    runtime failure is a separate concern.
 

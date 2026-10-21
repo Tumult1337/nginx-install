@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -41,16 +42,32 @@ func tempLayout(t *testing.T) Layout {
 
 // fakeExec records calls; returns canned err / output keyed by argv[0].
 type fakeExec struct {
-	mu    sync.Mutex
-	calls [][]string
-	fail  map[string]error // argv[0] -> err
-	out   map[string][]byte
+	mu      sync.Mutex
+	calls   [][]string
+	fail    map[string]error // argv[0] -> err
+	out     map[string][]byte
+	hook    func(name string, args []string)
+	respond func(name string, args []string) (fakeResult, bool)
+}
+
+type fakeResult struct {
+	out []byte
+	err error
 }
 
 func (f *fakeExec) Run(name string, args ...string) ([]byte, error) {
 	f.mu.Lock()
-	defer f.mu.Unlock()
 	f.calls = append(f.calls, append([]string{name}, args...))
+	hook, respond := f.hook, f.respond
+	f.mu.Unlock()
+	if hook != nil {
+		hook(name, args)
+	}
+	if respond != nil {
+		if result, ok := respond(name, args); ok {
+			return result.out, result.err
+		}
+	}
 	if e, ok := f.fail[name]; ok {
 		return f.out[name], e
 	}
@@ -993,11 +1010,15 @@ func TestRunUpgradeDryRunPrintsRecipe(t *testing.T) {
 	for _, want := range []string{
 		"apt-get install --only-upgrade -y nginx",
 		"--brotli-build --force",
+		"nginx-gen --main",
 		"systemctl restart nginx",
 	} {
 		if !strings.Contains(stdout.String(), want) {
 			t.Errorf("dry-run missing %q:\n%s", want, stdout.String())
 		}
+	}
+	if strings.Contains(stdout.String(), "render /etc/nginx/nginx.conf") {
+		t.Errorf("dry-run must not promise a nginx.conf render:\n%s", stdout.String())
 	}
 	if exec.called("apt-get") {
 		t.Errorf("dry-run must not exec, got %v", exec.calls)
@@ -1574,5 +1595,716 @@ func TestDefaultCertDirs(t *testing.T) {
 	t.Setenv("NGINX_CERT_DIR", "/srv/certs")
 	if got := defaultCertDirs(); len(got) != 1 || got[0] != "/srv/certs" {
 		t.Errorf("$NGINX_CERT_DIR must be the only base, got %v", got)
+	}
+}
+
+func advancingClock(d *Deps) {
+	ticks := 0
+	d.Now = func() time.Time {
+		ticks++
+		return fixedNow.Add(time.Duration(ticks) * time.Minute)
+	}
+}
+
+func backupEntries(t *testing.T, d Deps) []string {
+	t.Helper()
+	entries, err := os.ReadDir(d.Layout.BackupDir)
+	if os.IsNotExist(err) {
+		return nil
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	names := make([]string, 0, len(entries))
+	for _, e := range entries {
+		names = append(names, e.Name())
+	}
+	return names
+}
+
+func statFile(t *testing.T, path string) os.FileInfo {
+	t.Helper()
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return info
+}
+
+func readFile(t *testing.T, path string) []byte {
+	t.Helper()
+	b, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return b
+}
+
+func TestRunMainTwiceSameInputSkipsBackupAndWrite(t *testing.T) {
+	d, _, _, stderr := defaultDepsFor(t)
+	advancingClock(&d)
+
+	if code := Run([]string{"--main"}, d); code != exitOK {
+		t.Fatalf("run 1 exit=%d stderr=%s", code, stderr)
+	}
+	before := statFile(t, d.Layout.MainConfPath)
+	stderr.Reset()
+
+	if code := Run([]string{"--main"}, d); code != exitOK {
+		t.Fatalf("run 2 exit=%d stderr=%s", code, stderr)
+	}
+	if got := backupEntries(t, d); len(got) != 0 {
+		t.Errorf("run 2 made backups: %v", got)
+	}
+	if !strings.Contains(stderr.String(), "unchanged: "+d.Layout.MainConfPath) {
+		t.Errorf("stderr missing unchanged line:\n%s", stderr)
+	}
+	if !os.SameFile(before, statFile(t, d.Layout.MainConfPath)) {
+		t.Error("run 2 rewrote nginx.conf")
+	}
+}
+
+func TestRunMainChangedInputBacksUpOldBytes(t *testing.T) {
+	d, _, _, stderr := defaultDepsFor(t)
+	advancingClock(&d)
+	if code := Run([]string{"--main", "--brotli=off"}, d); code != exitOK {
+		t.Fatalf("run 1 exit=%d stderr=%s", code, stderr)
+	}
+	old := readFile(t, d.Layout.MainConfPath)
+	if err := os.MkdirAll(d.Layout.ModulesEnabledDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	loadConf := filepath.Join(d.Layout.ModulesEnabledDir, brotliLoadConf)
+	if err := os.WriteFile(loadConf, []byte("load_module x;\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	d.Now = func() time.Time { return fixedNow.Add(time.Hour) }
+
+	if code := Run([]string{"--main", "--brotli=on"}, d); code != exitOK {
+		t.Fatalf("run 2 exit=%d stderr=%s", code, stderr)
+	}
+	got := backupEntries(t, d)
+	if len(got) != 1 {
+		t.Fatalf("backups: %v", got)
+	}
+	if !strings.Contains(got[0], "20260503T130000Z") {
+		t.Errorf("backup name %q lacks the stamp of d.Now()", got[0])
+	}
+	if !bytes.Equal(readFile(t, filepath.Join(d.Layout.BackupDir, got[0])), old) {
+		t.Error("backup does not hold the old bytes")
+	}
+}
+
+func TestRunVhostTwiceSameInputSkipsBackupAndWrite(t *testing.T) {
+	d, _, _, stderr := defaultDepsFor(t)
+	advancingClock(&d)
+	htmlDir := t.TempDir()
+	target := filepath.Join(d.Layout.SitesAvailable, "u.example.com.conf")
+
+	if code := Run([]string{"--ssl=false", "u.example.com", htmlDir}, d); code != exitOK {
+		t.Fatalf("run 1 exit=%d stderr=%s", code, stderr)
+	}
+	before := statFile(t, target)
+	stderr.Reset()
+
+	if code := Run([]string{"--ssl=false", "u.example.com", htmlDir}, d); code != exitOK {
+		t.Fatalf("run 2 exit=%d stderr=%s", code, stderr)
+	}
+	if got := backupEntries(t, d); len(got) != 0 {
+		t.Errorf("run 2 made backups: %v", got)
+	}
+	if !strings.Contains(stderr.String(), "unchanged: "+target) {
+		t.Errorf("stderr missing unchanged line:\n%s", stderr)
+	}
+	if !os.SameFile(before, statFile(t, target)) {
+		t.Error("run 2 rewrote the vhost")
+	}
+}
+
+func TestRunVhostChangedInputBacksUpOldBytes(t *testing.T) {
+	d, _, _, stderr := defaultDepsFor(t)
+	advancingClock(&d)
+	target := filepath.Join(d.Layout.SitesAvailable, "u.example.com.conf")
+
+	if code := Run([]string{"--ssl=false", "u.example.com", t.TempDir()}, d); code != exitOK {
+		t.Fatalf("run 1 exit=%d stderr=%s", code, stderr)
+	}
+	old := readFile(t, target)
+
+	if code := Run([]string{"--ssl=false", "u.example.com", t.TempDir()}, d); code != exitOK {
+		t.Fatalf("run 2 exit=%d stderr=%s", code, stderr)
+	}
+	got := backupEntries(t, d)
+	if len(got) != 1 {
+		t.Fatalf("backups: %v", got)
+	}
+	if !bytes.Equal(readFile(t, filepath.Join(d.Layout.BackupDir, got[0])), old) {
+		t.Error("backup does not hold the old bytes")
+	}
+	if bytes.Equal(readFile(t, target), old) {
+		t.Error("vhost was not rewritten")
+	}
+}
+
+func TestRunVhostUnchangedKeptWhenNginxTestFails(t *testing.T) {
+	d, exec, _, stderr := defaultDepsFor(t)
+	advancingClock(&d)
+	htmlDir := t.TempDir()
+	target := filepath.Join(d.Layout.SitesAvailable, "u.example.com.conf")
+
+	if code := Run([]string{"--ssl=false", "u.example.com", htmlDir}, d); code != exitOK {
+		t.Fatalf("run 1 exit=%d stderr=%s", code, stderr)
+	}
+	want := readFile(t, target)
+	exec.fail["nginx"] = errors.New("exit 1")
+
+	if code := Run([]string{"--ssl=false", "u.example.com", htmlDir}, d); code != exitValidation {
+		t.Fatalf("run 2 exit=%d stderr=%s", code, stderr)
+	}
+	if got := readFile(t, target); !bytes.Equal(got, want) {
+		t.Errorf("vhost changed after failed nginx -t:\n%s", got)
+	}
+}
+
+func TestRunMainUnchangedKeptWhenNginxTestFails(t *testing.T) {
+	d, exec, _, stderr := defaultDepsFor(t)
+	advancingClock(&d)
+
+	if code := Run([]string{"--main"}, d); code != exitOK {
+		t.Fatalf("run 1 exit=%d stderr=%s", code, stderr)
+	}
+	want := readFile(t, d.Layout.MainConfPath)
+	exec.fail["nginx"] = errors.New("exit 1")
+
+	if code := Run([]string{"--main"}, d); code != exitValidation {
+		t.Fatalf("run 2 exit=%d stderr=%s", code, stderr)
+	}
+	if got := readFile(t, d.Layout.MainConfPath); !bytes.Equal(got, want) {
+		t.Errorf("nginx.conf changed after failed nginx -t:\n%s", got)
+	}
+}
+
+func sysctlFilePaths(t *testing.T, d Deps) (string, string) {
+	t.Helper()
+	if err := os.MkdirAll(filepath.Dir(d.Layout.SysctlPath), 0755); err != nil {
+		t.Fatal(err)
+	}
+	return d.Layout.SysctlPath, filepath.Join(d.Layout.SystemdOverrideDir, "override.conf")
+}
+
+func TestRunSysctlTwiceSameInputSkipsBackupAndWrite(t *testing.T) {
+	d, _, _, stderr := defaultDepsFor(t)
+	sysctlPath, overridePath := sysctlFilePaths(t, d)
+
+	if code := Run([]string{"--sysctl", "--no-reload"}, d); code != exitOK {
+		t.Fatalf("run 1 exit=%d stderr=%s", code, stderr)
+	}
+	sysctlBefore, overrideBefore := statFile(t, sysctlPath), statFile(t, overridePath)
+	stderr.Reset()
+
+	if code := Run([]string{"--sysctl", "--no-reload"}, d); code != exitOK {
+		t.Fatalf("run 2 exit=%d stderr=%s", code, stderr)
+	}
+	if got := backupEntries(t, d); len(got) != 0 {
+		t.Errorf("run 2 made backups: %v", got)
+	}
+	for _, path := range []string{sysctlPath, overridePath} {
+		if !strings.Contains(stderr.String(), "unchanged: "+path) {
+			t.Errorf("stderr missing unchanged line for %s:\n%s", path, stderr)
+		}
+	}
+	if !os.SameFile(sysctlBefore, statFile(t, sysctlPath)) || !os.SameFile(overrideBefore, statFile(t, overridePath)) {
+		t.Error("run 2 rewrote a file")
+	}
+}
+
+func TestRunSysctlUnchangedKeptWhenSysctlSystemFails(t *testing.T) {
+	d, exec, _, stderr := defaultDepsFor(t)
+	sysctlPath, overridePath := sysctlFilePaths(t, d)
+	if code := Run([]string{"--sysctl", "--no-reload"}, d); code != exitOK {
+		t.Fatalf("run 1 exit=%d stderr=%s", code, stderr)
+	}
+	wantSysctl, wantOverride := readFile(t, sysctlPath), readFile(t, overridePath)
+	exec.fail["sysctl"] = errors.New("exit 1")
+
+	if code := Run([]string{"--sysctl"}, d); code != exitSystemErr {
+		t.Fatalf("run 2 exit=%d stderr=%s", code, stderr)
+	}
+	if got := readFile(t, sysctlPath); !bytes.Equal(got, wantSysctl) {
+		t.Errorf("sysctl file changed:\n%s", got)
+	}
+	if got := readFile(t, overridePath); !bytes.Equal(got, wantOverride) {
+		t.Errorf("override file changed:\n%s", got)
+	}
+}
+
+func TestRunSysctlUnchangedKeptWhenDaemonReloadFails(t *testing.T) {
+	d, exec, _, stderr := defaultDepsFor(t)
+	sysctlPath, overridePath := sysctlFilePaths(t, d)
+	if code := Run([]string{"--sysctl", "--no-reload"}, d); code != exitOK {
+		t.Fatalf("run 1 exit=%d stderr=%s", code, stderr)
+	}
+	wantSysctl, wantOverride := readFile(t, sysctlPath), readFile(t, overridePath)
+	exec.fail["systemctl"] = errors.New("exit 1")
+
+	if code := Run([]string{"--sysctl"}, d); code != exitSystemErr {
+		t.Fatalf("run 2 exit=%d stderr=%s", code, stderr)
+	}
+	if got := readFile(t, sysctlPath); !bytes.Equal(got, wantSysctl) {
+		t.Errorf("sysctl file changed:\n%s", got)
+	}
+	if got := readFile(t, overridePath); !bytes.Equal(got, wantOverride) {
+		t.Errorf("override file changed:\n%s", got)
+	}
+}
+
+func TestRunSysctlRollsBackOnlyTheChangedFile(t *testing.T) {
+	d, exec, _, stderr := defaultDepsFor(t)
+	sysctlPath, overridePath := sysctlFilePaths(t, d)
+	if code := Run([]string{"--sysctl", "--no-reload"}, d); code != exitOK {
+		t.Fatalf("run 1 exit=%d stderr=%s", code, stderr)
+	}
+	stale := []byte(sysctlManagedPrefix + "\nnet.core.somaxconn = 1\n")
+	if err := os.WriteFile(sysctlPath, stale, 0644); err != nil {
+		t.Fatal(err)
+	}
+	wantOverride := readFile(t, overridePath)
+	exec.fail["sysctl"] = errors.New("exit 1")
+
+	if code := Run([]string{"--sysctl"}, d); code != exitSystemErr {
+		t.Fatalf("run 2 exit=%d stderr=%s", code, stderr)
+	}
+	if got := readFile(t, sysctlPath); !bytes.Equal(got, stale) {
+		t.Errorf("sysctl file not restored:\n%s", got)
+	}
+	if got := readFile(t, overridePath); !bytes.Equal(got, wantOverride) {
+		t.Errorf("unchanged override file touched:\n%s", got)
+	}
+}
+
+func upgradeDeps(t *testing.T) (Deps, *fakeExec, *bytes.Buffer) {
+	t.Helper()
+	d, exec, _, stderr := defaultDepsFor(t)
+	d.Geteuid = func() int { return 0 }
+	exec.out["nginx"] = []byte("nginx version: nginx/1.27.0\n")
+	return d, exec, stderr
+}
+
+func TestRunUpgradeLeavesUnmanagedMainConfAlone(t *testing.T) {
+	d, exec, stderr := upgradeDeps(t)
+	unmanaged := []byte("user nginx;\nevents {}\nhttp {}\n")
+	if err := os.WriteFile(d.Layout.MainConfPath, unmanaged, 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, args := range [][]string{{"--upgrade"}, {"--upgrade", "--force"}} {
+		if code := Run(args, d); code != exitOK {
+			t.Fatalf("%v exit=%d stderr=%s", args, code, stderr)
+		}
+		if got := readFile(t, d.Layout.MainConfPath); !bytes.Equal(got, unmanaged) {
+			t.Errorf("%v rewrote nginx.conf:\n%s", args, got)
+		}
+		if got := backupEntries(t, d); len(got) != 0 {
+			t.Errorf("%v made backups: %v", args, got)
+		}
+	}
+	if !exec.called("apt-get") || !exec.called("systemctl") {
+		t.Errorf("upgrade did not run apt-get and restart: %v", exec.calls)
+	}
+}
+
+func TestRunUpgradeRefusesWhenBrotliDirectivesLostTheirModule(t *testing.T) {
+	d, exec, stderr := upgradeDeps(t)
+	withBrotli := []byte("events {}\nhttp {\n    brotli on;\n}\n")
+	if err := os.WriteFile(d.Layout.MainConfPath, withBrotli, 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	if code := Run([]string{"--upgrade"}, d); code != exitValidation {
+		t.Fatalf("exit=%d stderr=%s", code, stderr)
+	}
+	if !strings.Contains(stderr.String(), "--main") {
+		t.Errorf("stderr does not name --main:\n%s", stderr)
+	}
+	for _, c := range exec.calls {
+		if c[0] == "systemctl" && len(c) > 1 && c[1] == "restart" {
+			t.Errorf("nginx was restarted: %v", exec.calls)
+		}
+	}
+	if got := readFile(t, d.Layout.MainConfPath); !bytes.Equal(got, withBrotli) {
+		t.Errorf("nginx.conf changed:\n%s", got)
+	}
+}
+
+func TestRunUpgradeIgnoresCommentedBrotliDirective(t *testing.T) {
+	d, _, stderr := upgradeDeps(t)
+	conf := []byte("events {}\nhttp {\n    # brotli on;\n}\n")
+	if err := os.WriteFile(d.Layout.MainConfPath, conf, 0644); err != nil {
+		t.Fatal(err)
+	}
+	if code := Run([]string{"--upgrade"}, d); code != exitOK {
+		t.Fatalf("exit=%d stderr=%s", code, stderr)
+	}
+}
+
+func TestRunUpgradeAllowsBrotliDirectivesWhenModuleLoaded(t *testing.T) {
+	d, _, stderr := upgradeDeps(t)
+	conf := []byte("events {}\nhttp {\n    brotli_comp_level 5;\n}\n")
+	if err := os.WriteFile(d.Layout.MainConfPath, conf, 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(d.Layout.ModulesEnabledDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	loadConf := filepath.Join(d.Layout.ModulesEnabledDir, brotliLoadConf)
+	if err := os.WriteFile(loadConf, []byte("# built against nginx 1.27.0\nload_module x;\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if code := Run([]string{"--upgrade"}, d); code != exitOK {
+		t.Fatalf("exit=%d stderr=%s", code, stderr)
+	}
+}
+
+func TestRunSysctlWritesNothingWhenOverrideCannotBeRead(t *testing.T) {
+	d, _, _, stderr := defaultDepsFor(t)
+	sysctlPath, overridePath := sysctlFilePaths(t, d)
+	stale := []byte(sysctlManagedPrefix + "net.core.somaxconn = 1\n")
+	if err := os.WriteFile(sysctlPath, stale, 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(overridePath, 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	if code := Run([]string{"--sysctl", "--no-reload"}, d); code != exitSystemErr {
+		t.Fatalf("exit=%d stderr=%s", code, stderr)
+	}
+	if got := readFile(t, sysctlPath); !bytes.Equal(got, stale) {
+		t.Errorf("sysctl file was written:\n%s", got)
+	}
+}
+
+func TestRunVhostSymlinkFailureKeepsUnchangedFile(t *testing.T) {
+	d, _, _, stderr := defaultDepsFor(t)
+	advancingClock(&d)
+	htmlDir := t.TempDir()
+	target := filepath.Join(d.Layout.SitesAvailable, "u.example.com.conf")
+	link := filepath.Join(d.Layout.SitesEnabled, "u.example.com.conf")
+
+	if code := Run([]string{"--ssl=false", "u.example.com", htmlDir}, d); code != exitOK {
+		t.Fatalf("run 1 exit=%d stderr=%s", code, stderr)
+	}
+	want := readFile(t, target)
+	if err := os.Remove(link); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(link, []byte("regular file"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	if code := Run([]string{"--ssl=false", "u.example.com", htmlDir}, d); code != exitSystemErr {
+		t.Fatalf("run 2 exit=%d stderr=%s", code, stderr)
+	}
+	if got := readFile(t, target); !bytes.Equal(got, want) {
+		t.Errorf("vhost changed after symlink failure:\n%s", got)
+	}
+}
+
+func TestRunVhostUnreadableTargetWritesNothing(t *testing.T) {
+	d, _, _, stderr := defaultDepsFor(t)
+	target := filepath.Join(d.Layout.SitesAvailable, "u.example.com.conf")
+	if err := os.MkdirAll(target, 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	if code := Run([]string{"--ssl=false", "u.example.com", t.TempDir()}, d); code != exitSystemErr {
+		t.Fatalf("exit=%d stderr=%s", code, stderr)
+	}
+	if !statFile(t, target).IsDir() {
+		t.Error("target directory was replaced")
+	}
+	if got := backupEntries(t, d); len(got) != 0 {
+		t.Errorf("backups made: %v", got)
+	}
+}
+
+func TestRunUpgradeRefusesOnBrotliUnderscoreDirective(t *testing.T) {
+	d, _, stderr := upgradeDeps(t)
+	conf := []byte("events {}\nhttp {\n    brotli_static on;\n}\n")
+	if err := os.WriteFile(d.Layout.MainConfPath, conf, 0644); err != nil {
+		t.Fatal(err)
+	}
+	if code := Run([]string{"--upgrade"}, d); code != exitValidation {
+		t.Fatalf("exit=%d stderr=%s", code, stderr)
+	}
+}
+
+const packagedBrotliConf = "50-mod-http-brotli-filter.conf"
+
+func seedBrotliConf(t *testing.T, d Deps, name, content string) string {
+	t.Helper()
+	if err := os.MkdirAll(d.Layout.ModulesEnabledDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(d.Layout.ModulesEnabledDir, name)
+	if err := os.WriteFile(path, []byte(content), 0644); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+func fakeDpkg(exec *fakeExec, installed ...string) {
+	exec.respond = func(name string, args []string) (fakeResult, bool) {
+		if name != "dpkg-query" {
+			return fakeResult{}, false
+		}
+		if slices.Contains(installed, args[len(args)-1]) {
+			return fakeResult{out: []byte("ii ")}, true
+		}
+		return fakeResult{out: []byte("dpkg-query: no packages found"), err: errors.New("exit 1")}, true
+	}
+}
+
+func restartCalled(exec *fakeExec) bool {
+	exec.mu.Lock()
+	defer exec.mu.Unlock()
+	for _, c := range exec.calls {
+		if c[0] == "systemctl" && len(c) > 1 && c[1] == "restart" {
+			return true
+		}
+	}
+	return false
+}
+
+func nginxTestCalled(exec *fakeExec) bool {
+	exec.mu.Lock()
+	defer exec.mu.Unlock()
+	for _, c := range exec.calls {
+		if c[0] == "nginx" && slices.Contains(c, "-t") {
+			return true
+		}
+	}
+	return false
+}
+
+func upgradeAptCall(exec *fakeExec) []string {
+	exec.mu.Lock()
+	defer exec.mu.Unlock()
+	for _, c := range exec.calls {
+		if c[0] == "apt-get" && slices.Contains(c, "--only-upgrade") {
+			return c
+		}
+	}
+	return nil
+}
+
+func aptCallHasBrotliPackages(call []string) bool {
+	for _, pkg := range brotliPackages {
+		if !slices.Contains(call, pkg) {
+			return false
+		}
+	}
+	return true
+}
+
+func aptCallHasAnyBrotliPackage(call []string) bool {
+	for _, pkg := range brotliPackages {
+		if slices.Contains(call, pkg) {
+			return true
+		}
+	}
+	return false
+}
+
+func TestRunUpgradePackagedBrotliStillLoadedUpgradesPackagesWithoutBuild(t *testing.T) {
+	for _, args := range [][]string{{"--upgrade"}, {"--upgrade", "--force"}} {
+		d, exec, stderr := upgradeDeps(t)
+		fakeDpkg(exec, brotliPackages...)
+		seedBrotliConf(t, d, packagedBrotliConf, "load_module x;\n")
+
+		if code := Run(args, d); code != exitOK {
+			t.Fatalf("%v exit=%d stderr=%s", args, code, stderr)
+		}
+		if strings.Contains(stderr.String(), "gone") {
+			t.Errorf("%v: stderr claims the module is gone:\n%s", args, stderr)
+		}
+		if !strings.Contains(stderr.String(), `"brotli_rebuilt":false`) {
+			t.Errorf("%v: log line lacks brotli_rebuilt false:\n%s", args, stderr)
+		}
+		call := upgradeAptCall(exec)
+		if call == nil || !aptCallHasBrotliPackages(call) {
+			t.Errorf("%v: apt call lacks brotli packages: %v", args, call)
+		}
+		if exec.called("curl") || exec.called("git") {
+			t.Errorf("%v: source build ran: %v", args, exec.calls)
+		}
+	}
+}
+
+func TestRunUpgradePackagedBrotliGoneAfterAptBuildsFromSource(t *testing.T) {
+	d, exec, stderr := upgradeDeps(t)
+	fakeDpkg(exec, brotliPackages...)
+	conf := seedBrotliConf(t, d, packagedBrotliConf, "load_module x;\n")
+	exec.hook = func(name string, args []string) {
+		if name == "apt-get" && slices.Contains(args, "--only-upgrade") {
+			_ = os.Remove(conf)
+		}
+	}
+
+	Run([]string{"--upgrade"}, d)
+	if !exec.called("curl") {
+		t.Errorf("no source build after the packaged module vanished: %v", exec.calls)
+	}
+	if !strings.Contains(stderr.String(), "packaged") {
+		t.Errorf("stderr does not say the packaged module is gone:\n%s", stderr)
+	}
+}
+
+func TestRunUpgradeOwnBrotliBuildDecision(t *testing.T) {
+	cases := []struct {
+		name      string
+		builtFor  string
+		args      []string
+		wantBuild bool
+	}{
+		{"matching version", "1.27.0", []string{"--upgrade"}, false},
+		{"drift", "1.26.0", []string{"--upgrade"}, true},
+		{"matching version with force", "1.27.0", []string{"--upgrade", "--force"}, true},
+	}
+	for _, c := range cases {
+		d, exec, stderr := upgradeDeps(t)
+		seedBrotliConf(t, d, brotliLoadConf, "# Managed by nginx-gen; built against nginx "+c.builtFor+"\nload_module x;\n")
+
+		code := Run(c.args, d)
+		if !c.wantBuild && code != exitOK {
+			t.Errorf("%s: exit=%d stderr=%s", c.name, code, stderr)
+		}
+		if got := exec.called("curl"); got != c.wantBuild {
+			t.Errorf("%s: build ran=%t, want %t", c.name, got, c.wantBuild)
+		}
+		if call := upgradeAptCall(exec); call == nil || aptCallHasAnyBrotliPackage(call) {
+			t.Errorf("%s: apt call must not hold brotli packages: %v", c.name, call)
+		}
+	}
+}
+
+func TestRunUpgradeNoBrotliSkipsPackagesAndBuild(t *testing.T) {
+	d, exec, stderr := upgradeDeps(t)
+
+	if code := Run([]string{"--upgrade", "--force"}, d); code != exitOK {
+		t.Fatalf("exit=%d stderr=%s", code, stderr)
+	}
+	call := upgradeAptCall(exec)
+	if call == nil || aptCallHasAnyBrotliPackage(call) {
+		t.Errorf("apt call must not hold brotli packages: %v", call)
+	}
+	if exec.called("curl") {
+		t.Errorf("source build ran: %v", exec.calls)
+	}
+}
+
+func TestRunUpgradePackagedUpgradesOnlyInstalledPackages(t *testing.T) {
+	d, exec, stderr := upgradeDeps(t)
+	fakeDpkg(exec, brotliPackages[0])
+	seedBrotliConf(t, d, packagedBrotliConf, "load_module x;\n")
+
+	if code := Run([]string{"--upgrade"}, d); code != exitOK {
+		t.Fatalf("exit=%d stderr=%s", code, stderr)
+	}
+	call := upgradeAptCall(exec)
+	if !slices.Contains(call, brotliPackages[0]) {
+		t.Errorf("apt call lacks the installed package: %v", call)
+	}
+	if slices.Contains(call, brotliPackages[1]) {
+		t.Errorf("apt call holds a package that is not installed: %v", call)
+	}
+}
+
+func TestRunUpgradeUnknownBrotliSourceTouchesNothing(t *testing.T) {
+	notInstalled := map[string]func(*fakeExec){
+		"dpkg-query fails": func(exec *fakeExec) { fakeDpkg(exec) },
+		"status not ii": func(exec *fakeExec) {
+			exec.respond = func(name string, _ []string) (fakeResult, bool) {
+				if name == "dpkg-query" {
+					return fakeResult{out: []byte("un ")}, true
+				}
+				return fakeResult{}, false
+			}
+		},
+	}
+	for name, setup := range notInstalled {
+		d, exec, stderr := upgradeDeps(t)
+		setup(exec)
+		seedBrotliConf(t, d, "50-hand-written-brotli.conf", "load_module x;\n")
+
+		if code := Run([]string{"--upgrade", "--force"}, d); code != exitOK {
+			t.Fatalf("%s: exit=%d stderr=%s", name, code, stderr)
+		}
+		call := upgradeAptCall(exec)
+		if call == nil || aptCallHasAnyBrotliPackage(call) {
+			t.Errorf("%s: apt call must not hold brotli packages: %v", name, call)
+		}
+		if exec.called("curl") {
+			t.Errorf("%s: source build ran: %v", name, exec.calls)
+		}
+	}
+}
+
+func TestRunUpgradeOwnBrotliBuildFailureStopsBeforeRestart(t *testing.T) {
+	d, exec, stderr := upgradeDeps(t)
+	seedBrotliConf(t, d, brotliLoadConf, "# Managed by nginx-gen; built against nginx 1.26.0\nload_module x;\n")
+	exec.fail["curl"] = errors.New("exit 1")
+
+	if code := Run([]string{"--upgrade"}, d); code != exitSystemErr {
+		t.Fatalf("exit=%d stderr=%s", code, stderr)
+	}
+	if restartCalled(exec) || nginxTestCalled(exec) {
+		t.Errorf("run continued after the failed rebuild: %v", exec.calls)
+	}
+}
+
+func gonePackagedWithFailingBuild(t *testing.T, mainConf string) (Deps, *fakeExec, *bytes.Buffer) {
+	t.Helper()
+	d, exec, stderr := upgradeDeps(t)
+	fakeDpkg(exec, brotliPackages...)
+	conf := seedBrotliConf(t, d, packagedBrotliConf, "load_module x;\n")
+	exec.hook = func(name string, args []string) {
+		if name == "apt-get" && slices.Contains(args, "--only-upgrade") {
+			_ = os.Remove(conf)
+		}
+	}
+	exec.fail["curl"] = errors.New("exit 1")
+	if err := os.WriteFile(d.Layout.MainConfPath, []byte(mainConf), 0644); err != nil {
+		t.Fatal(err)
+	}
+	return d, exec, stderr
+}
+
+func TestRunUpgradeFailedFallbackBuildWithBrotliDirectivesRefuses(t *testing.T) {
+	d, exec, stderr := gonePackagedWithFailingBuild(t, "events {}\nhttp {\n    brotli on;\n}\n")
+
+	if code := Run([]string{"--upgrade"}, d); code != exitValidation {
+		t.Fatalf("exit=%d stderr=%s", code, stderr)
+	}
+	if !strings.Contains(stderr.String(), "--main") {
+		t.Errorf("stderr does not name --main:\n%s", stderr)
+	}
+	if restartCalled(exec) {
+		t.Errorf("nginx was restarted: %v", exec.calls)
+	}
+}
+
+func TestRunUpgradeFailedFallbackBuildWithoutBrotliDirectivesContinues(t *testing.T) {
+	d, exec, stderr := gonePackagedWithFailingBuild(t, "events {}\nhttp {}\n")
+
+	if code := Run([]string{"--upgrade"}, d); code != exitOK {
+		t.Fatalf("exit=%d stderr=%s", code, stderr)
+	}
+	if !strings.Contains(stderr.String(), "download failed") {
+		t.Errorf("stderr does not show the build failure:\n%s", stderr)
+	}
+	if !nginxTestCalled(exec) || !restartCalled(exec) {
+		t.Errorf("run did not reach nginx -t and restart: %v", exec.calls)
 	}
 }

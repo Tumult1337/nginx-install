@@ -122,3 +122,46 @@ func RequireOurs(path string) (CheckResult, Header, error) {
 	}
 	return CheckNotOurs, Header{}, nil
 }
+
+func EqualIgnoringTS(a, b []byte) bool {
+	if _, ok := Parse(a); !ok {
+		return false
+	}
+	if _, ok := Parse(b); !ok {
+		return false
+	}
+	strippedA, ok := withoutTS(a)
+	if !ok {
+		return false
+	}
+	strippedB, ok := withoutTS(b)
+	if !ok {
+		return false
+	}
+	return bytes.Equal(strippedA, strippedB)
+}
+
+func withoutTS(content []byte) ([]byte, bool) {
+	firstEnd := bytes.IndexByte(content, '\n')
+	if firstEnd < 0 {
+		return nil, false
+	}
+	fieldStart := firstEnd + 1
+	fieldLen := bytes.IndexByte(content[fieldStart:], '\n')
+	if fieldLen < 0 {
+		fieldLen = len(content) - fieldStart
+	}
+	fieldEnd := fieldStart + fieldLen
+	field := content[fieldStart:fieldEnd]
+	tsStart := bytes.LastIndex(field, []byte(" ts="))
+	if tsStart < 0 {
+		return nil, false
+	}
+	value := string(field[tsStart+len(" ts="):])
+	if _, err := time.Parse(time.RFC3339, value); err != nil {
+		return nil, false
+	}
+	stripped := make([]byte, 0, len(content))
+	stripped = append(stripped, content[:fieldStart+tsStart]...)
+	return append(stripped, content[fieldEnd:]...), true
+}
